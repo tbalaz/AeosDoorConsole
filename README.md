@@ -1,7 +1,8 @@
 # AEOS Door Console
 
-A small local web page that talks to a Nedap AEOS SOAP web service: list the doors (entrances) and lock, unlock or
-provide access per door. It is one PowerShell script, no install, no internet needed.
+A small local web page that talks to a Nedap AEOS server: list the doors (entrances) over the SOAP web service and
+lock, unlock, provide access or set a door back to normal per door, over SOAP or over the AEOS socket interface. It is
+one PowerShell script, no install, no internet needed.
 
 The script is generic. Nedap's web service document is not public, so no AEOS operation name is built in: you map
 each action to a WSDL operation and a request template on site (Setup tab). Everything it sends is also written to a
@@ -68,6 +69,79 @@ Files created next to the script: `aeos-console.json` (your settings), `aeos-con
     the saved settings): it shows how many doors were parsed and the raw response.
 12. Go to **Doors**, *Load doors*, and use the buttons. Actions ask for confirmation in the page.
 
+## Door actions over the socket interface (Setup tab)
+
+AEOS 2023.2 has no door command in its SOAP service, so lock / unlock / access / normal go over the AEOS socket
+interface (TCP, TLS 1.2). Each of the four actions has a **Transport** (SOAP or Socket); *List doors* stays SOAP.
+Nothing AEOS-specific is built in: you type the values below on the Setup tab, **Socket interface** section and per
+action. The console opens one connection per click: connect, read the greeting, send the login, send each init
+command, send the action command, read one reply line for each, close. Every line sent and received goes to the debug
+log under the request id with control characters shown (`<CR>` `<LF>`); the login line is logged as `login(user,****);`.
+
+| Setup field | Value for AEOS 2023.2 |
+|---|---|
+| Host | the AEOS server (empty = the host of the AEOS URL) |
+| Port | `8035` |
+| Use TLS | on |
+| Skip TLS certificate validation | on (AEOS ships a Nedap example certificate; a red banner stays on the page) |
+| Line terminator | `CRLF` |
+| Greeting wait (ms) | `2000` |
+| Login command | `login({{user}},{{password}});` (user and password are the ones typed at the top of the page) |
+| Login success pattern | `^Response:true;` |
+| Init commands | `setRmiCommandConnection(true);` |
+| Reply timeout (s) | `10` |
+| Lock: Transport / Socket command | Socket / `execute(lock,"{{HostName}}:{{name}}");` (tested on site 2026-11-12) |
+| Unlock: Transport / Socket command | Socket / `execute(unlock,"{{HostName}}:{{name}}");` (tested on site 2026-11-12) |
+| Provide access: Transport / Socket command | Socket / `execute(provideAccess,"{{HostName}}:{{name}}");` (seen in the AEOS audit log) |
+| Normal: Transport / Socket command | Socket / `execute(normal,"{{HostName}}:{{name}}");` (door back to access control activated; seen in the AEOS audit log) |
+| Success pattern (each action) | `^Response:` |
+| List doors | SOAP: operation `findAccessPoint`, Door element `AccessPoint`, Id field `Id`, Name field `Name`, Extra columns `HostName` (confirm with *Test list*) |
+
+Command placeholders: `{{id}}`, `{{name}}` and `{{<extra column>}}` (any extra column of the door list, for example
+`{{HostName}}`); `{{user}}` and `{{password}}` work in the login command only. Values are not escaped: a door value
+holding a line break, a double quote or a semicolon (and a user name or password also a comma or a closing
+parenthesis) is refused with a clear message before anything is sent. A placeholder outside double quotes in the
+command also refuses a value with a comma or a parenthesis, so put door placeholders in quotes as in the example
+above. The user name and password still refuse only a comma and a closing parenthesis (an opening
+parenthesis is fine in a password). A reply counts as success when it matches the
+action's *Success pattern* (empty = any reply line); with a *Login success pattern* a rejected login stops the action
+with `login rejected: <reply>`. An action with no command stays hidden (the *Normal* button only shows once mapped).
+The **Raw call** tab has a *Send socket command* box that runs the same session with one typed command and shows every
+line sent and received; it is written to the audit file like a door action.
+
+## Door state, selection and lockdown (Doors tab)
+
+**State column.** On the Setup tab, **Door state** section, you type up to four *checks*. Each check has a label, a
+socket command and a match pattern (a regex on the reply line). A door's state is the label of the FIRST check whose
+reply matches; when none matches the state is the *Label when no check matches*. A check that got no reply, or a
+door with a refused value, shows `?` and the reason in the tooltip (hover the cell). With no check typed there is no
+State column. The checks use the Socket interface settings and the same placeholders as the action commands. Nothing
+AEOS-specific is built in. State is read after *Load doors*, with the *Refresh state* button (it reads the rows
+shown, so a filter narrows it), and after a door action (same session). One refresh uses ONE socket session for all
+doors: login and init once, then the checks for every door. No timer: refresh by hand.
+
+| Setup field (Door state) | Value for AEOS 2023.2 |
+|---|---|
+| Check 1: label / command / match | `Locked` / `execute(isLocked,"{{HostName}}:{{name}}");` / `^Response:true;$` |
+| Check 2: label / command / match | `Unlocked` / `execute(isUnlocked,"{{HostName}}:{{name}}");` / `^Response:true;$` |
+| Label when no check matches | `Normal` |
+| Max doors per refresh or batch | `500` |
+
+UNVERIFIED on site: `isLocked` answered `Response:false;` on a real AEOS 2023.2; the `Response:true;` reply and the
+`isUnlocked` query have not been tried yet. Try them with the **Raw call** tab socket box on a locked and an unlocked
+door first, and adjust the match patterns to what AEOS really answers.
+
+**Selection and batch.** Every door row has a checkbox; the header checkbox selects all shown rows. The batch bar
+shows the count and one button per mapped action ("Lock selected" ...); each asks for confirmation naming the number
+of doors and the first five names. Over the socket the whole batch is ONE session: login and init once, one command
+per door, then the state checks of every door. A door with a refused value (see above) is reported "refused, not
+sent" and the others go on. A SOAP action runs call by call. The page waits for the whole batch (the console handles
+one request at a time), then fills each row with its result and state. Every door gets its own audit record, tagged
+`batch:<request id>`. The number of doors per batch or refresh is limited by *Max doors per refresh or batch*.
+
+**Lockdown** locks every door in the list (not only the shown or selected ones) with the Lock action. Its confirm
+dialog names the action, the number of doors and the first five names. It shows only when Lock is mapped.
+
 ## Finding the right operations: Aeos-WsdlHelper.ps1
 
 AEOS publishes some 200 operations, named verb first (`change...`, `find...`), so the door ones are hard to spot in
@@ -90,7 +164,7 @@ The output is also saved as `aeos-wsdl-<time>.txt` next to the script - send tha
 AEOS's SOAP service lists the doors (`findAccessPoint` returns each access point's `Name` and `HostName`) but has no
 lock or unlock operation. Door commands go through the AEOS socket interface (TCP 8035), which the Milestone Nedap
 plugin also uses; the AEOS log shows them as `execute(<function>,"<HostName>:<Name>");` with the functions `lock`,
-`unlock`, `normal` (access control activated), `provideAccess`, `isLocked` and `isUnlocked` (`lock` assumed).
+`unlock`, `normal` (access control activated), `provideAccess`, `isLocked` and `isUnlocked`.
 
 `Aeos-SocketTest.ps1` connects once, logs in, sends `setRmiCommandConnection(true);` and ONE function, and prints
 every byte AEOS sends back (control characters shown as `<CR>` `<LF>` `<ETX>`), saved as `aeos-socket-<time>.txt`:
@@ -111,10 +185,32 @@ network unencrypted.
 ## Tabs
 
 - **Doors**: load, filter, and run the mapped actions. Each row shows the result and a **request id**.
-- **Setup**: connection and mappings (above).
+- **Setup**: license, connection and mappings (above).
 - **Raw call**: send any request body to the service and see the response. Use this to explore the web service.
 - **Audit**: the last 50 door actions and whether the audit chain is intact.
 - **Debug**: live view of the debug log, download of the whole log, diagnostics zip.
+
+## License and trial
+
+The console runs with a license from your supplier. Without a license file it runs as a **30-day trial**, counted from
+the first start.
+
+- The header chip shows the state: `Trial - N days left`, `Licensed`, `Trial ended` or `License invalid`. The Setup tab
+  has a **License** box with the status, the details of the license, the **AEOS host** (with a Copy button) and
+  **Import license file**.
+- Send the AEOS host from that box to your supplier. The license is issued for that host name.
+- **Import license file**: choose the `license.json` you received. The console checks it first; a file that is not valid
+  is refused with the reason and is not saved. A valid file is saved as `license.json` in the folder of the config file
+  (`-LicenseFile <path>` uses another place) and takes effect at once.
+- A license is valid when: the signature is correct, it is for this product, today is not after its expiry date (no
+  expiry date = no end), the host of the AEOS URL (and the socket host, when you set one) is in its host list, and the
+  door list has no more doors than the license allows (0 = unlimited).
+- With no valid license or trial a red banner shows the reason. The door list, door state, Setup, Audit and Debug stay
+  available. Door actions, batch actions, Lockdown and both Raw call tabs are off: the buttons are disabled, and the
+  console answers a forced request with HTTP 402 `license_required`.
+- The first-start date of the trial is in `trial.json` next to the config file.
+- API: `GET /api/v1/license` returns `state` (`trial`, `licensed`, `expired`, `invalid`), `reason`, `daysLeft`,
+  `details` and `aeosHost`. `PUT /api/v1/license` takes the text of `license.json`; an invalid file gives 400 and is not saved.
 
 ## Debug log and diagnostics (please send these back)
 

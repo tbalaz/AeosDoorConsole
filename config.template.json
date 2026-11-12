@@ -10,10 +10,28 @@
   "auditFile": "",
   "debugLogFile": "",
   "debugLevel": "full",
+  "socket": {
+    "host": "",
+    "port": 0,
+    "tls": true,
+    "tlsSkipValidation": false,
+    "terminator": "CRLF",
+    "greetingWaitMs": 2000,
+    "loginTemplate": "",
+    "loginSuccessPattern": "",
+    "initCommands": [],
+    "replyTimeoutSec": 10
+  },
   "actions": {
     "listDoors": { "operation": "", "soapAction": "", "body": "", "itemElement": "", "idField": "", "nameField": "", "extraFields": [] },
-    "lock":   { "label": "Lock",           "operation": "", "soapAction": "", "body": "", "confirm": true },
-    "unlock": { "label": "Unlock",         "operation": "", "soapAction": "", "body": "", "confirm": true },
-    "access": { "label": "Provide access", "operation": "", "soapAction": "", "body": "", "confirm": true }
+    "lock":   { "label": "Lock",           "transport": "soap", "operation": "", "soapAction": "", "body": "", "command": "", "successPattern": "", "confirm": true },
+    "unlock": { "label": "Unlock",         "transport": "soap", "operation": "", "soapAction": "", "body": "", "command": "", "successPattern": "", "confirm": true },
+    "access": { "label": "Provide access", "transport": "soap", "operation": "", "soapAction": "", "body": "", "command": "", "successPattern": "", "confirm": true },
+    "normal": { "label": "Normal",         "transport": "soap", "operation": "", "soapAction": "", "body": "", "command": "", "successPattern": "", "confirm": true }
+  },
+  "doorState": {
+    "checks": [],
+    "otherwiseLabel": "",
+    "maxDoorsPerRefresh": 500
   }
 }
