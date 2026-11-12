@@ -68,6 +68,21 @@ Files created next to the script: `aeos-console.json` (your settings), `aeos-con
     the saved settings): it shows how many doors were parsed and the raw response.
 12. Go to **Doors**, *Load doors*, and use the buttons. Actions ask for confirmation in the page.
 
+## Finding the right operations: Aeos-WsdlHelper.ps1
+
+AEOS publishes some 200 operations, named verb first (`change...`, `find...`), so the door ones are hard to spot in
+the dropdowns. `Aeos-WsdlHelper.ps1` (read-only, sends no SOAP request) lists the operations whose names match a
+pattern, each with its request element, its fields and the allowed values of fields with a fixed value list (such as
+a mode or state):
+
+```
+powershell -ExecutionPolicy Bypass -File .\Aeos-WsdlHelper.ps1 -AeosUrl https://<aeos-server>:8443/aeosws -SkipTlsCheck
+```
+
+The default pattern looks for access points, entrances, doors, lock, release, block, open, mode, state and status;
+`-Match entrance` narrows it, `-Match .` lists everything. Add `-AskCredential` if the WSDL needs the AEOS login.
+The output is also saved as `aeos-wsdl-<time>.txt` next to the script - send that file back when asking for help.
+
 ## Tabs
 
 - **Doors**: load, filter, and run the mapped actions. Each row shows the result and a **request id**.
