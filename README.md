@@ -80,7 +80,9 @@ powershell -ExecutionPolicy Bypass -File .\Aeos-WsdlHelper.ps1 -AeosUrl https://
 ```
 
 The default pattern looks for access points, entrances, doors, lock, release, block, open, mode, state and status;
-`-Match entrance` narrows it, `-Match .` lists everything. Add `-AskCredential` if the WSDL needs the AEOS login.
+`-Match entrance` narrows it, `-Match .` lists everything. `-FieldMatch 'lock|unlock'` instead finds operations by
+their request fields and allowed values, whatever the operation is called (add `-Match` to combine both). Add
+`-AskCredential` if the WSDL needs the AEOS login.
 The output is also saved as `aeos-wsdl-<time>.txt` next to the script - send that file back when asking for help.
 
 ## Tabs

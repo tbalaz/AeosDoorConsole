@@ -15,17 +15,23 @@
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File .\Aeos-WsdlHelper.ps1 -AeosUrl https://aeos-server:8443/aeosws -SkipTlsCheck -Match entrance -AskCredential
     (-Match '.' lists every operation; -AskCredential when the WSDL needs the AEOS login)
+.EXAMPLE
+    powershell -ExecutionPolicy Bypass -File .\Aeos-WsdlHelper.ps1 -AeosUrl https://aeos-server:8443/aeosws -SkipTlsCheck -FieldMatch 'lock|unlock|accesscontrol'
+    (-FieldMatch finds operations by their request FIELDS or allowed values, whatever the operation is called;
+     add -Match too to also include operations by name)
 #>
 param(
     [Parameter(Mandatory = $true)][string]$AeosUrl,                 # the AEOS web service URL, as on the Setup tab
     [string]$WsdlUrl = '',                                          # empty = AeosUrl + ?wsdl
     [string]$Match = 'accesspoint|entrance|door|lock|release|block|open|mode|state|status',   # regex on operation names
+    [string]$FieldMatch = '',                                       # regex on request field names / allowed values
     [int]$Depth = 2,                                                # how many levels of nested fields to show
     [switch]$SkipTlsCheck,                                          # self-signed AEOS certificate (this run only)
     [switch]$AskCredential,                                         # ask for the AEOS user if the WSDL needs a login
     [pscredential]$Credential                                       # or pass one (when called from a PowerShell session)
 )
 $ErrorActionPreference = 'Stop'
+$script:MatchGiven = $PSBoundParameters.ContainsKey('Match')
 # Same connection settings as Aeos-DoorConsole.ps1 (proven against AEOS): TLS 1.2, no proxy, no keep-alive,
 # a compiled per-request certificate callback (a PowerShell scriptblock callback is not reliable there).
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -163,25 +169,39 @@ $main = {
     $tns = $wsdl.DocumentElement.GetAttribute('targetNamespace')
     $all = @{}
     foreach ($op in @($wsdl.SelectNodes("//*[local-name()='portType']/*[local-name()='operation']"))) { $all[$op.GetAttribute('name')] = $op }
-    $names = @($all.Keys | Where-Object { $_ -match $Match } | Sort-Object)
-    "Target namespace: $tns - $($all.Count) operations, $($names.Count) match '$Match', files read: $($script:Docs.Count)"
+    # With -FieldMatch alone, operations are chosen by their request fields / allowed values only.
+    $nameFilter = if ($FieldMatch -and -not $script:MatchGiven) { '' } else { $Match }
+    $shown = New-Object System.Collections.Generic.List[string]
+    $hits = 0
+    foreach ($n in @($all.Keys | Sort-Object)) {
+        $nameHit = [bool]$nameFilter -and ($n -match $nameFilter)
+        if (-not $nameHit -and -not $FieldMatch) { continue }
+        $lines = @(Get-OperationLines $all[$n])
+        $fieldHit = [bool]$FieldMatch -and (@($lines | Where-Object { $_ -match $FieldMatch }).Count -gt 0)
+        if (-not ($nameHit -or $fieldHit)) { continue }
+        $hits++
+        $shown.Add("=== $n$(if($fieldHit -and -not $nameHit){'   (request field / value matches)'})")
+        foreach ($l in $lines) { $shown.Add($l) }
+        $shown.Add('')
+    }
+    $what = @(); if ($nameFilter) { $what += "name matches '$nameFilter'" }; if ($FieldMatch) { $what += "request field or value matches '$FieldMatch'" }
+    "Target namespace: $tns - $($all.Count) operations, $hits shown ($($what -join ' or ')), files read: $($script:Docs.Count)"
     ''
-    foreach ($n in $names) {
-        $op = $all[$n]
-        "=== $n"
-        $in = $op.SelectSingleNode("./*[local-name()='input']")
-        if (-not $in) { '    (no request message)'; continue }
-        $msg = Find-Node 'message' (Get-LocalName $in.GetAttribute('message'))
-        if (-not $msg) { "    (request message $($in.GetAttribute('message')) not found)"; continue }
-        foreach ($part in @($msg.SelectNodes("./*[local-name()='part']"))) {
-            $pe = $part.GetAttribute('element'); $pt = $part.GetAttribute('type')
-            if ($pe) { "    request element: $(Get-LocalName $pe)"; Show-Element (Get-LocalName $pe) '        ' }
-            elseif ($pt) {
-                "    request part $($part.GetAttribute('name')) : $pt"
-                if (-not (Test-BuiltinType $pt)) { $ct = Find-Node 'complexType' (Get-LocalName $pt); if ($ct) { Show-Type $ct '        ' 1 } }
-            }
+    $shown
+}
+# Request element and fields of one operation, as text lines.
+function Get-OperationLines($Op) {
+    $in = $Op.SelectSingleNode("./*[local-name()='input']")
+    if (-not $in) { '    (no request message)'; return }
+    $msg = Find-Node 'message' (Get-LocalName $in.GetAttribute('message'))
+    if (-not $msg) { "    (request message $($in.GetAttribute('message')) not found)"; return }
+    foreach ($part in @($msg.SelectNodes("./*[local-name()='part']"))) {
+        $pe = $part.GetAttribute('element'); $pt = $part.GetAttribute('type')
+        if ($pe) { "    request element: $(Get-LocalName $pe)"; Show-Element (Get-LocalName $pe) '        ' }
+        elseif ($pt) {
+            "    request part $($part.GetAttribute('name')) : $pt"
+            if (-not (Test-BuiltinType $pt)) { $ct = Find-Node 'complexType' (Get-LocalName $pt); if ($ct) { Show-Type $ct '        ' 1 } }
         }
-        ''
     }
 }
 $out = @(& $main)
