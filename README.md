@@ -34,7 +34,8 @@ Files created next to the script: `aeos-console.json` (your settings), `aeos-con
    empty to use the AEOS URL plus `?wsdl`, or paste the WSDL URL if you were given one.
 3. **Log in** at the top of the page with the AEOS user and password. The password is kept in memory only: it is never
    written to disk, never put in the log, and is forgotten when you log out or stop the script.
-4. **Load WSDL.** Click *Load WSDL*. The page lists the operations of the service. If your AEOS version publishes no
+4. **Load WSDL.** Click *Load WSDL*. It saves what is on the Setup tab first, so a URL you just typed is used, then
+   fills every operation dropdown with the operations of the service, sorted A-Z. If your AEOS version publishes no
    WSDL, get the WSDL file or the web service document from the AEOS administrator.
 5. **Map each action.** For each of *List doors*, *Lock*, *Unlock*, *Provide access*:
    - pick the WSDL operation in the dropdown (the SOAP action is filled in for you);
@@ -63,7 +64,8 @@ Files created next to the script: `aeos-console.json` (your settings), `aeos-con
     not trust, either install the CA on this PC (preferred) or tick *Skip TLS certificate validation*. A red warning
     banner stays on the page while it is on. The skip applies to AEOS calls only. The log records the server certificate
     (subject, issuer, thumbprint, validity, names) on every connection.
-11. **Save**, then *Test list* (it uses the saved settings): it shows how many doors were parsed and the raw response.
+11. **Save** (the Save bar stays at the bottom of the window while you scroll the Setup tab), then *Test list* (it uses
+    the saved settings): it shows how many doors were parsed and the raw response.
 12. Go to **Doors**, *Load doors*, and use the buttons. Actions ask for confirmation in the page.
 
 ## Tabs

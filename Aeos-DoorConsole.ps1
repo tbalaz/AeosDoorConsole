@@ -1176,6 +1176,8 @@ pre{background:#101820;color:#d8e4f0;padding:10px;overflow:auto;max-height:480px
 .msg{margin:8px 0;min-height:20px}
 .msg.bad{color:#a00000;font-weight:600}
 .msg.good{color:#0a6b2a;font-weight:600}
+.setup-bar{position:sticky;bottom:0;background:#fff;border-top:1px solid #c5cdd8;padding:2px 0;z-index:5}
+.setup-bar p{margin:6px 0}
 #confirm{display:none;position:fixed;inset:0;background:rgba(0,0,0,.45);align-items:center;justify-content:center;z-index:10}
 #confirm .box{background:#fff;padding:20px 24px;border-radius:6px;min-width:320px;max-width:520px}
 #confirm .row{margin-top:16px;text-align:right}
@@ -1225,11 +1227,13 @@ pre{background:#101820;color:#d8e4f0;padding:10px;overflow:auto;max-height:480px
   </fieldset>
   <p><button id="btn-load-wsdl">Load WSDL</button> <span id="wsdl-status"></span></p>
   <div id="setup-actions"></div>
+  <div class="setup-bar">
   <p>
     <button id="btn-save">Save</button>
     <button id="btn-test-list">Test list (uses saved settings)</button>
   </p>
   <div class="msg" id="setup-msg"></div>
+  </div>
   <pre id="test-list-out" style="display:none"></pre>
 </div>
 
@@ -1461,31 +1465,33 @@ function readSetup(){
   l.extraFields=$('extraFields').value.split(',').map(function(s){return s.trim();}).filter(function(s){return s;});
   return c;
 }
-function loadWsdl(statusId){
-  setMsg(statusId,'Loading WSDL...');
-  return api('GET','/api/v1/wsdl').then(function(r){
-    OPS=r.operations||[];
-    ACTIONS.forEach(function(a){fillOps($('op-'+a));});fillOps($('raw-op'));
-    if(r.targetNamespace&&!$('cfg-targetNamespace').value){$('cfg-targetNamespace').value=r.targetNamespace;}
-    if(r.soapVersion){$('cfg-soapVersion').value=r.soapVersion;}
-    setMsg(statusId,OPS.length+' operations loaded, target namespace "'+r.targetNamespace+'", SOAP '+r.soapVersion+' (request id '+r._rid+')','good');
-  }).catch(function(e){setMsg(statusId,errText(e),'bad');});
+/* Save what is on the Setup tab, then reload it from the server (header, banners, doors follow). */
+function saveSetup(){
+  return api('PUT','/api/v1/config',readSetup()).then(function(r){
+    return api('GET','/api/v1/config').then(function(c){CFG=c;fillSetup();renderBanners();renderDoors();return r;});
+  });
 }
-$('btn-load-wsdl').onclick=function(){
-  $('wsdl-status').textContent='Loading WSDL...';
-  api('GET','/api/v1/wsdl').then(function(r){
-    OPS=r.operations||[];
-    ACTIONS.forEach(function(a){fillOps($('op-'+a));});fillOps($('raw-op'));
-    if(r.targetNamespace&&!$('cfg-targetNamespace').value){$('cfg-targetNamespace').value=r.targetNamespace;}
-    if(r.soapVersion){$('cfg-soapVersion').value=r.soapVersion;}
-    $('wsdl-status').textContent=OPS.length+' operations loaded, target namespace "'+r.targetNamespace+'", SOAP '+r.soapVersion+' (request id '+r._rid+')';
-  }).catch(function(e){$('wsdl-status').textContent='WSDL failed: '+errText(e);});
-};
+function byOpName(a,b){var x=a.name.toLowerCase(),y=b.name.toLowerCase();return x<y?-1:(x>y?1:0);}
+/* Load WSDL works on what is on screen: it saves the Setup first, lists the operations A-Z, and saves
+   again so the target namespace and SOAP version it found are kept. show(text, cls) reports progress. */
+function loadWsdl(show){
+  show('Saving settings, loading WSDL...','');
+  saveSetup().then(function(){
+    api('GET','/api/v1/wsdl').then(function(r){
+      OPS=(r.operations||[]).slice().sort(byOpName);
+      ACTIONS.forEach(function(a){fillOps($('op-'+a));});fillOps($('raw-op'));
+      if(r.targetNamespace&&!$('cfg-targetNamespace').value){$('cfg-targetNamespace').value=r.targetNamespace;}
+      if(r.soapVersion){$('cfg-soapVersion').value=r.soapVersion;}
+      var done=OPS.length+' operations loaded (A-Z), target namespace "'+r.targetNamespace+'", SOAP '+r.soapVersion+' (request id '+r._rid+')';
+      saveSetup().then(function(){show(done,'good');}).catch(function(e){show(done+' - but not saved: '+errText(e),'bad');});
+    }).catch(function(e){show('WSDL failed: '+errText(e),'bad');});
+  }).catch(function(e){show('Not saved, so the WSDL was not loaded: '+errText(e),'bad');});
+}
+$('btn-load-wsdl').onclick=function(){loadWsdl(function(t,c){var s=$('wsdl-status');s.textContent=t;s.className=c||'';});};
 $('btn-save').onclick=function(){
   setMsg('setup-msg','Saving...');
-  api('PUT','/api/v1/config',readSetup()).then(function(r){
-    return api('GET','/api/v1/config').then(function(c){CFG=c;fillSetup();renderBanners();renderDoors();setMsg('setup-msg','Saved (request id '+r._rid+')','good');});
-  }).catch(function(e){setMsg('setup-msg','Not saved: '+errText(e),'bad');});
+  saveSetup().then(function(r){setMsg('setup-msg','Saved (request id '+r._rid+')','good');})
+    .catch(function(e){setMsg('setup-msg','Not saved: '+errText(e),'bad');});
 };
 $('btn-test-list').onclick=function(){
   var out=$('test-list-out');out.style.display='none';setMsg('setup-msg','Testing...');
@@ -1497,7 +1503,7 @@ $('btn-test-list').onclick=function(){
 };
 
 /* ---- raw call ---- */
-$('btn-raw-load').onclick=function(){loadWsdl('raw-msg');};
+$('btn-raw-load').onclick=function(){loadWsdl(function(t,c){setMsg('raw-msg',t,c);});};
 $('raw-op').onchange=function(){
   var o=opByName($('raw-op').value);
   if(o){$('raw-soapaction').value=o.soapAction||'';if(!$('raw-body').value){$('raw-body').value=o.skeleton;}}
