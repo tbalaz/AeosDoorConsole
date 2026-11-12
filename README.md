@@ -1,6 +1,6 @@
-# AEOS Door Console
+# DoorKeeper
 
-A small local web page that talks to a Nedap AEOS server: list the doors (entrances) over the SOAP web service and
+DoorKeeper by IT42 is a small local web page for Nedap AEOS. It talks to an AEOS server: list the doors (entrances) over the SOAP web service and
 lock, unlock, provide access or set a door back to normal per door, over SOAP or over the AEOS socket interface. It is
 one PowerShell script, no install, no internet needed.
 
@@ -18,15 +18,15 @@ debug log, so when something does not work you can send that log back.
 ## Run
 
 ```
-powershell -ExecutionPolicy Bypass -File .\Aeos-DoorConsole.ps1
+powershell -ExecutionPolicy Bypass -File .\DoorKeeper.ps1
 ```
 
-Options: `-Port 8765` (default), `-ConfigFile <path>` (default `aeos-console.json` next to the script, created on first
-run), `-NoBrowser` (do not open the browser). The page opens on `http://localhost:8765/`. Press Ctrl+C in the window
+Options: `-Port 8765` (default), `-ConfigFile <path>` (default `doorkeeper.json` next to the script, created on first
+run; an existing `aeos-console.json` from an older version is used when `doorkeeper.json` is missing), `-NoBrowser` (do not open the browser). The page opens on `http://localhost:8765/`. Press Ctrl+C in the window
 to stop. Only this PC can reach the page.
 
-Files created next to the script: `aeos-console.json` (your settings), `aeos-console-audit.jsonl` (audit),
-`aeos-console-debug.log` (debug log), `aeos-console-diag-<time>.zip` (diagnostics, on request).
+Files created next to the script: `doorkeeper.json` (your settings), `doorkeeper-audit.jsonl` (audit),
+`doorkeeper-debug.log` (debug log), `doorkeeper-diag-<time>.zip` (diagnostics, on request).
 
 ## First-run setup on site
 
@@ -216,14 +216,14 @@ the first start.
 
 When something fails, **send the debug log or the diagnostics zip to the integrator**. They are written for this.
 
-- **Debug log**: `aeos-console-debug.log` next to the script (setting *Debug log file* changes the place; it rotates at
+- **Debug log**: `doorkeeper-debug.log` next to the script (setting *Debug log file* changes the place; it rotates at
   10 MB to `.1`). It is always on. It holds the start-up details (script, PowerShell, .NET, OS, enabled TLS versions,
   settings), every request to AEOS with headers and the full SOAP request and response, the server certificate details,
   every error with all inner exceptions and stack trace, and every call the page makes to this script. The setting
   *Debug level* `basic` leaves the SOAP bodies out.
 - **Where the log lines are**: every error on the page ends with `(request id xxxxxxxx)`. That id starts the matching
   lines in the log. Please include the id when you report a problem.
-- **Diagnostics zip**: Debug tab, *Create diagnostics zip*. It shows the path of `aeos-console-diag-<time>.zip` and a
+- **Diagnostics zip**: Debug tab, *Create diagnostics zip*. It shows the path of `doorkeeper-diag-<time>.zip` and a
   download link. It contains the debug log, your settings, the audit file and a short environment report.
 - **Secrets**: the password is never written. The `Authorization` header is logged as `Basic ****`, a WS-Security
   password as `****`, and the password text itself is replaced by `****` anywhere before a line is written. The log does
@@ -231,7 +231,7 @@ When something fails, **send the debug log or the diagnostics zip to the integra
 
 ## Audit
 
-Every door action (success or failure) is appended to `aeos-console-audit.jsonl` before the page gets its answer: time (UTC),
+Every door action (success or failure) is appended to `doorkeeper-audit.jsonl` before the page gets its answer: time (UTC),
 Windows user, AEOS user, action, door, HTTP status, result and fault text. Each record carries the hash of the previous one
 (SHA-256 chain), so a changed or deleted line breaks the chain; the Audit tab shows "Chain OK" or "CHAIN BROKEN".
 

@@ -2,7 +2,7 @@
 .SYNOPSIS
     Read-only: lists the operations of the AEOS SOAP web service whose names match a pattern, each with its
     request element and fields, straight from the WSDL. Use it to find which operation to map to List doors,
-    Lock, Unlock and Provide access in Aeos-DoorConsole.ps1.
+    Lock, Unlock and Provide access in DoorKeeper.ps1.
 .DESCRIPTION
     Reads <AeosUrl>?wsdl (or -WsdlUrl) and every XSD / WSDL it imports. For each operation whose name matches
     -Match it prints the request element, its fields (name : type, optional / list), nested fields down to
@@ -32,7 +32,7 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 $script:MatchGiven = $PSBoundParameters.ContainsKey('Match')
-# Same connection settings as Aeos-DoorConsole.ps1 (proven against AEOS): TLS 1.2, no proxy, no keep-alive,
+# Same connection settings as DoorKeeper.ps1 (proven against AEOS): TLS 1.2, no proxy, no keep-alive,
 # a compiled per-request certificate callback (a PowerShell scriptblock callback is not reliable there).
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 if (-not ('AeosHelperTls' -as [type])) {

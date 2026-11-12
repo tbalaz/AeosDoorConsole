@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    AEOS Door Console - local web page that forwards calls to a Nedap AEOS SOAP web service.
+    DoorKeeper by IT42 - local web page that forwards calls to a Nedap AEOS SOAP web service.
 
 .DESCRIPTION
     Single self-contained Windows PowerShell 5.1 script. Serves http://localhost:<Port>/ (HttpListener,
@@ -11,10 +11,11 @@
     Security: per-start random token (meta tag, header X-Console-Token on /api/v1/*), Origin check,
     AEOS password kept in memory only (PSCredential), never logged or written. Certificate validation
     can be skipped per request only (compiled callback), never globally. Every door action is written to
-    a hash-chained audit file. A thorough debug log (aeos-console-debug.log) is always on.
+    a hash-chained audit file. A thorough debug log (doorkeeper-debug.log) is always on.
 
 .PARAMETER ConfigFile
-    Site config. Default: aeos-console.json next to the script (created from cleared defaults if missing).
+    Site config. Default: doorkeeper.json next to the script (created from cleared defaults if missing). If it is missing and
+    aeos-console.json (the old name) exists next to the script, that file is used.
 
 .PARAMETER LicenseFile
     License file. Default: license.json in the folder of the config file. Without a license file the console
@@ -27,8 +28,8 @@
     Do not open the default browser.
 
 .EXAMPLE
-    powershell -ExecutionPolicy Bypass -File .\Aeos-DoorConsole.ps1
-    powershell -ExecutionPolicy Bypass -File .\Aeos-DoorConsole.ps1 -Port 9000 -NoBrowser
+    powershell -ExecutionPolicy Bypass -File .\DoorKeeper.ps1
+    powershell -ExecutionPolicy Bypass -File .\DoorKeeper.ps1 -Port 9000 -NoBrowser
 #>
 [CmdletBinding()]
 param(
@@ -43,7 +44,7 @@ $script:Version = '1.0.0'
 # ---- License constants: the product rename is ONE edit here ------------------------------------------------------
 # $script:LicenseProductId must equal the "product" field of every issued license (tools\New-License.ps1 $ProductId).
 # $script:LicensePublicKeyXml is the public half of the signing key (same text as tools\license-public-key.xml).
-$script:LicenseProductId = 'DoorControl42'
+$script:LicenseProductId = 'DoorKeeper'
 $script:LicensePublicKeyXml = '<RSAKeyValue><Modulus>0b9MUB0Iyk066tBoQ+AGwP+QeC6wncUgZjZ73U8Mb8F/i066yp90NRD3obyoxdqUNv6ZfVY8Gv9xElOk7UkTiNfMXnIrt4DUrgNC+s1Z6Ul0wvMoDFuLgK+Kwqed23aI1LVVXY6EeF5uhMe3ddTemgm7N9J56cfmPLcjciOO/s6XexmwdOBw4vvt9XUK8k26ExBdm3bAkIP6/A7DymCc8UKqAU5/ALzRkp4VTQ4AEqCKfFKfqJ4zuYofCpqujhgivFzIc/Kf6EdjIQM3C++7w6Ba3cdTmiIoL8hbDUvJeIMQhRj4aEirxC9OGnzPAtxkzdsih6j93T6iDnVRcS9D3GVxV8OZ2WeFIDOUhaR9mp1Gi2HvzH7pTyvHQ2w19RME8k1e/z5LqlNEHwpUaa03bXbeZannhIo51jzD7ZmPHHTzLtZdahyzOtVqPPbOUK5hVnAQq9gDPYvC79CkrFkZt1p1Ya1ZsZFIdeleM/G/TXdMS8nGxfAlh2r0TlxjyZRV</Modulus><Exponent>AQAB</Exponent></RSAKeyValue>'
 $script:TrialDays = 30
 # ------------------------------------------------------------------------------------------------------------------
@@ -913,7 +914,7 @@ function Write-DebugLog {
 
 function Get-EnvironmentText {
     $sb = New-Object System.Text.StringBuilder
-    [void]$sb.AppendLine('Aeos-DoorConsole version: ' + $script:Version)
+    [void]$sb.AppendLine('DoorKeeper version: ' + $script:Version)
     [void]$sb.AppendLine('Time (UTC): ' + [DateTime]::UtcNow.ToString('o'))
     [void]$sb.AppendLine('PowerShell: ' + $PSVersionTable.PSVersion + ' (' + $PSVersionTable.PSEdition + ')')
     [void]$sb.AppendLine('CLR: ' + [Environment]::Version)
@@ -938,7 +939,7 @@ function Get-EnvironmentText {
 function Write-StartupBlock {
     param([string]$Url)
     $rid = 'startup'
-    Write-DebugLog $rid '==================== Aeos-DoorConsole start ===================='
+    Write-DebugLog $rid '==================== DoorKeeper start ===================='
     Write-DebugLog $rid ((Get-EnvironmentText).TrimEnd())
     Write-DebugLog $rid ('Listener URL: ' + $Url)
     $lic = Get-CurrentLicense
@@ -947,8 +948,8 @@ function Write-StartupBlock {
 }
 
 function Initialize-Paths {
-    $script:AuditPath = Resolve-DataPath -Value ([string]$script:Config.auditFile) -BaseDir $script:ScriptDir -DefaultName 'aeos-console-audit.jsonl'
-    $script:DebugLogPath = Resolve-DataPath -Value ([string]$script:Config.debugLogFile) -BaseDir $script:ScriptDir -DefaultName 'aeos-console-debug.log'
+    $script:AuditPath = Resolve-DataPath -Value ([string]$script:Config.auditFile) -BaseDir $script:ScriptDir -DefaultName 'doorkeeper-audit.jsonl'
+    $script:DebugLogPath = Resolve-DataPath -Value ([string]$script:Config.debugLogFile) -BaseDir $script:ScriptDir -DefaultName 'doorkeeper-debug.log'
     $script:LastAuditHash = $script:ZeroHash
     $recs = @(Read-AuditRecords)
     if ($recs.Count -gt 0) {
@@ -1095,7 +1096,7 @@ function Invoke-AeosHttp {
     $req.Proxy = $null
     $req.KeepAlive = $false
     $req.AllowAutoRedirect = $false
-    $req.UserAgent = 'Aeos-DoorConsole/' + $script:Version
+    $req.UserAgent = 'DoorKeeper/' + $script:Version
     $req.ServicePoint.Expect100Continue = $false
     if ($Url -match '^https') { $req.ServerCertificateValidationCallback = $cb.Callback }
     $hdr = New-Object System.Collections.Generic.List[string]
@@ -1831,7 +1832,7 @@ function New-DiagnosticsZip {
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $dir = Split-Path -Parent $script:DebugLogPath
     if (-not (Test-Path -LiteralPath $dir)) { [void](New-Item -ItemType Directory -Path $dir -Force) }
-    $name = 'aeos-console-diag-' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '.zip'
+    $name = 'doorkeeper-diag-' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '.zip'
     $path = Join-Path $dir $name
     $fs = [System.IO.File]::Open($path, [System.IO.FileMode]::Create)
     try {
@@ -1878,7 +1879,7 @@ function Invoke-Route {
     $path = $req.Url.AbsolutePath
     if (-not $req.IsLocal) { return (New-ErrorResult 403 'forbidden' 'Requests are accepted from this computer only.') }
     if ($method -eq 'GET' -and $path -eq '/') {
-        $html = $script:PageHtml.Replace('__TOKEN__', $script:Token)
+        $html = $script:PageHtml.Replace('__TOKEN__', $script:Token).Replace('__VERSION__', $script:Version)
         return @{ Status = 200; Bytes = [System.Text.Encoding]::UTF8.GetBytes($html); ContentType = 'text/html; charset=utf-8'
             Headers = @{ 'Content-Security-Policy' = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; img-src data:; base-uri 'none'; form-action 'none'" } }
     }
@@ -2014,7 +2015,7 @@ function Invoke-Route {
         }
         'GET /api/v1/diagnostics/download' {
             $f = [string]$req.QueryString['file']
-            if ($f -notmatch '^aeos-console-diag-\d{8}-\d{6}\.zip$') { throw (New-ApiException 400 'bad_request' 'Bad file name.') }
+            if ($f -notmatch '^doorkeeper-diag-\d{8}-\d{6}\.zip$') { throw (New-ApiException 400 'bad_request' 'Bad file name.') }
             $p = Join-Path (Split-Path -Parent $script:DebugLogPath) $f
             if (-not (Test-Path -LiteralPath $p)) { throw (New-ApiException 404 'not_found' 'No such diagnostics file.') }
             return @{ Status = 200; Bytes = [System.IO.File]::ReadAllBytes($p); ContentType = 'application/zip'
@@ -2092,62 +2093,129 @@ $script:PageHtml = @'
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="console-token" content="__TOKEN__">
-<title>AEOS Door Console</title>
+<meta name="console-version" content="__VERSION__">
+<title>DoorKeeper</title>
 <style>
+:root{--ink:#131C30;--blue:#4B8BFF;--blue-deep:#2F6FE0;--blue-dark:#1E4FB8;--text:#1F2733;--muted:#5F6B7A;--line:#D9DDE5;--field:#C9CFDA;
+--surface:#F3F5F8;--tint:#EEF3FF;--tint-line:#BFD3FF;--red:#B42318;--head-line:#3A4660;--head-muted:#AEB8C8;--head-text:#E8ECF2;
+--amber-bg:#FFE4BF;--amber-fg:#7A3E00;--ok-bg:#E7F6EE;--ok-fg:#0B5A31;--bad-bg:#FDE8E6;--bad-fg:#7A1A12;--bad-line:#F4B7B0;--mono:Consolas,'Cascadia Mono',monospace}
 *{box-sizing:border-box}
-body{margin:0;font:14px/1.4 Segoe UI,Arial,sans-serif;color:#1d2733;background:#f3f5f8}
-header{background:#14304f;color:#fff;padding:10px 16px;display:flex;flex-wrap:wrap;gap:12px;align-items:center}
-header h1{font-size:18px;margin:0 12px 0 0}
-header input{padding:5px 7px;border:1px solid #8aa;border-radius:3px;width:140px}
-header button{padding:5px 12px}
-#aeos-url{opacity:.85;font-size:12px}
-.chip{display:none;padding:3px 10px;border-radius:12px;font-size:12px;font-weight:600;background:#e4e9f0;color:#14304f}
-.chip.chip-trial{background:#ffe9b0;color:#6a4500}
-.chip.chip-ok{background:#c9f0d4;color:#0a4d1f}
-.chip.chip-bad{background:#ffd2d2;color:#7a0000}
-#banners div{padding:8px 16px;font-weight:600}
-.warn{background:#ffe9b0;color:#6a4500}
-.err{background:#ffd2d2;color:#7a0000}
-nav{display:flex;gap:4px;padding:10px 16px 0}
-nav button{padding:8px 16px;border:1px solid #c5cdd8;border-bottom:none;background:#e4e9f0;border-radius:4px 4px 0 0;cursor:pointer}
-nav button.active{background:#fff;font-weight:600}
-.panel{display:none;background:#fff;margin:0 16px 16px;padding:16px;border:1px solid #c5cdd8;min-height:300px}
+body{margin:0;font:14px/1.4 'Segoe UI',Arial,sans-serif;color:var(--text);background:var(--surface)}
+a{color:var(--blue-deep)}
+header{background:var(--ink);color:var(--head-text);padding:12px 24px;display:flex;flex-wrap:wrap;gap:16px;align-items:center}
+.brand{display:flex;align-items:center;gap:14px}
+.brand svg{height:20px;width:75px}
+.vsep{width:1px;height:24px;background:var(--head-line)}
+.brand-text{display:flex;flex-direction:column}
+header h1{font-size:18px;font-weight:600;margin:0;color:#fff}
+.sub{font-size:12px;color:var(--head-muted)}
+.grow{flex:1 1 0}
+header input{height:36px;padding:0 10px;border:1px solid var(--head-line);border-radius:6px;width:140px;background:#fff;color:var(--text);font:inherit}
+header button{height:36px;padding:0 14px;background:transparent;color:var(--head-text);border:1px solid var(--head-line);border-radius:6px}
+header button:hover{filter:none;background:#1C2842}
+#aeos-url{display:inline-flex;align-items:center;gap:8px;padding:6px 12px;border:1px solid var(--head-line);border-radius:6px;font-size:12px;color:var(--head-muted)}
+#aeos-url::before{content:'';width:8px;height:8px;border-radius:50%;background:#7BE0A8}
+#login-state{font-weight:600;color:#fff;margin-right:8px}
+#login-msg{color:#FFB4AB;font-weight:600}
+.chip{display:none;align-items:center;gap:6px;padding:6px 12px;border-radius:999px;font-size:12px;font-weight:600;background:var(--tint);color:var(--blue-dark)}
+.chip.chip-trial{background:var(--tint);color:var(--blue-dark)}
+.chip.chip-ok{background:var(--ok-bg);color:var(--ok-fg)}
+.chip.chip-bad{background:var(--bad-bg);color:var(--bad-fg);font-weight:700}
+#banners div{padding:12px 24px;font-weight:600;display:flex;align-items:center;gap:10px}
+#banners div::before{content:'';flex:0 0 18px;height:18px;background:center/contain no-repeat url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23131C30' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M10.3 3.9L1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z'/%3E%3Cline x1='12' y1='9' x2='12' y2='13'/%3E%3Cline x1='12' y1='17' x2='12.01' y2='17'/%3E%3C/svg%3E")}
+.warn{background:var(--amber-bg);color:var(--amber-fg);border-bottom:1px solid #F0C98A}
+.err{background:var(--bad-bg);color:var(--bad-fg);border-bottom:1px solid var(--bad-line)}
+nav{display:flex;flex-wrap:wrap;gap:4px;padding:0 24px;background:#fff;border-bottom:1px solid var(--line)}
+nav button{height:48px;padding:0 18px;background:transparent;border:none;border-bottom:3px solid transparent;color:var(--muted);cursor:pointer;border-radius:0}
+nav button:hover{filter:none;color:var(--ink)}
+nav button.active{border-bottom-color:var(--blue-deep);color:var(--ink);font-weight:600}
+.panel{display:none;background:#fff;margin:20px auto;width:calc(100% - 48px);max-width:1360px;padding:20px 24px;border:1px solid var(--line);border-radius:8px;min-height:300px}
 .panel.active{display:block}
+.toolbar{display:flex;flex-wrap:wrap;align-items:center;gap:10px}
+#door-counts{display:flex;flex-wrap:wrap;gap:6px;font-size:12px;font-weight:600}
+#door-counts span{padding:4px 10px;border-radius:999px;background:#fff;border:1px solid var(--line);color:var(--text)}
+#door-counts span.s-locked{background:var(--ink);color:#fff;border-color:var(--ink)}
+#door-counts span.s-unlocked{background:var(--amber-bg);color:var(--amber-fg);border-color:var(--amber-bg)}
+#door-counts span.s-normal{background:#E6EEFF;color:var(--blue-dark);border-color:#E6EEFF}
+#door-counts span.s-unknown{background:#EDEFF3;color:#4A5563;border-color:#EDEFF3}
 table{border-collapse:collapse;width:100%}
-th,td{border-bottom:1px solid #e1e6ed;padding:6px 8px;text-align:left;vertical-align:top}
-th{background:#f3f5f8}
-button{font:inherit;cursor:pointer;padding:5px 12px}
-button.act{margin-right:6px}
+th,td{border-bottom:1px solid #ECEEF2;padding:10px 8px;text-align:left;vertical-align:middle}
+th{background:#F7F8FA;color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.04em;font-weight:600;border-bottom:1px solid var(--line)}
+#doors-body td:nth-child(2){font-weight:600;color:var(--ink)}
+tr.picked{background:#F3F7FF}
+button{font:inherit;cursor:pointer;height:36px;padding:0 14px;background:#fff;color:var(--ink);border:1px solid var(--field);border-radius:6px}
+button:hover{filter:brightness(.96)}
+button.primary{background:var(--blue-deep);color:#fff;border:none;font-weight:600;height:40px;padding:0 16px}
+button.act{margin-right:6px;height:30px;padding:0 10px;font-size:13px}
 button:disabled{opacity:.5;cursor:default}
+button svg{vertical-align:-3px;margin-right:6px}
 .result.ok{color:#0a6b2a;font-weight:600}
-.result.bad{color:#a00000;font-weight:600}
-td.state{font-weight:600;white-space:nowrap}
-td.state.unknown{color:#a00000}
-#batch-bar{margin:8px 0;padding:6px 8px;background:#eef2f7;border:1px solid #c5cdd8}
-#batch-bar button{margin-right:6px}
-button.lockdown{background:#a00000;color:#fff;border:1px solid #700}
-fieldset{margin:0 0 14px;border:1px solid #c5cdd8}
-legend{font-weight:600}
+.result.bad{color:var(--red);font-weight:600}
+td.state{white-space:nowrap}
+.schip{display:inline-flex;align-items:center;gap:6px;padding:4px 10px;border-radius:999px;font-size:12px;font-weight:700}
+.schip svg{flex:0 0 14px}
+.schip.s-locked{background:var(--ink);color:#fff}
+.schip.s-unlocked{background:var(--amber-bg);color:var(--amber-fg)}
+.schip.s-normal{background:#E6EEFF;color:var(--blue-dark)}
+.schip.s-unknown{background:#EDEFF3;color:#4A5563}
+#batch-bar{display:flex;flex-wrap:wrap;align-items:center;gap:10px;margin:12px 0;padding:10px 14px;background:var(--tint);border:1px solid var(--tint-line);border-radius:8px}
+#batch-count{color:var(--ink);margin-right:6px}
+#batch-buttons{display:contents}
+#batch-bar button[data-batch=lock]{background:var(--ink);color:#fff;border:none;font-weight:600}
+button.lockdown{margin-left:auto;background:var(--red);color:#fff;border:none;font-weight:700;height:40px;padding:0 18px}
+fieldset{margin:0 0 14px;border:1px solid var(--line);border-radius:8px;padding:12px 16px}
+legend{font-weight:600;color:var(--ink);padding:0 6px}
 label{display:inline-block;margin:3px 12px 3px 0}
-label span{display:block;font-size:12px;color:#52606f}
-input[type=text],input[type=number],select,textarea{padding:5px 7px;border:1px solid #aab;border-radius:3px;font:inherit}
-textarea{width:100%;min-height:80px;font:12px Consolas,monospace}
-pre{background:#101820;color:#d8e4f0;padding:10px;overflow:auto;max-height:480px;font:12px Consolas,monospace;white-space:pre-wrap;word-break:break-all}
+label span{display:block;font-size:12px;color:var(--muted)}
+input[type=text],input[type=number],input[type=password],select,textarea{padding:7px 9px;border:1px solid var(--field);border-radius:6px;font:inherit}
+input[type=text]:focus,input[type=number]:focus,select:focus,textarea:focus{outline:2px solid var(--blue);outline-offset:-1px}
+#door-filter{height:40px;min-width:260px}
+textarea{width:100%;min-height:80px;font:12px var(--mono)}
+pre{background:#101820;color:#d8e4f0;padding:10px;overflow:auto;max-height:480px;font:12px var(--mono);white-space:pre-wrap;word-break:break-all;border-radius:6px}
 .msg{margin:8px 0;min-height:20px}
-.msg.bad{color:#a00000;font-weight:600}
+.msg.bad{color:var(--red);font-weight:600}
 .msg.good{color:#0a6b2a;font-weight:600}
-.setup-bar{position:sticky;bottom:0;background:#fff;border-top:1px solid #c5cdd8;padding:2px 0;z-index:5}
+.setup-bar{position:sticky;bottom:0;background:#fff;border-top:1px solid var(--line);padding:2px 0;z-index:5}
 .setup-bar p{margin:6px 0}
-#confirm{display:none;position:fixed;inset:0;background:rgba(0,0,0,.45);align-items:center;justify-content:center;z-index:10}
-#confirm .box{background:#fff;padding:20px 24px;border-radius:6px;min-width:320px;max-width:520px}
-#confirm .row{margin-top:16px;text-align:right}
+#fs-license{padding:20px 24px;max-width:760px}
+#fs-license h2{margin:0 0 12px;font-size:18px;font-weight:600;color:var(--ink)}
+#lic-status{display:flex;align-items:center;gap:10px;padding:12px 14px;border-radius:6px;font-weight:600;background:var(--tint);color:var(--blue-dark);margin:0 0 14px}
+#lic-status.lic-ok{background:var(--ok-bg);color:var(--ok-fg)}
+#lic-status.lic-bad{background:var(--bad-bg);color:var(--bad-fg)}
+.kv{display:grid;grid-template-columns:180px minmax(0,1fr);row-gap:10px;column-gap:16px;margin:0 0 14px}
+.kv .k{color:var(--muted)}
+.kv code,#lic-host{font:13px var(--mono);background:var(--surface);padding:3px 8px;border-radius:4px}
+#lic-details table{margin:0 0 14px}
+#lic-details th{background:transparent;text-transform:none;letter-spacing:0;font-size:14px;width:180px;border:none;padding:4px 16px 4px 0}
+#lic-details td{border:none;padding:4px 0}
+#btn-import-license{height:44px;padding:0 18px;background:var(--blue-deep);color:#fff;border:none;font-weight:600}
+.dlg{display:none;position:fixed;inset:0;background:rgba(19,28,48,.55);align-items:center;justify-content:center;z-index:10}
+.dlg .box{background:#fff;border-radius:10px;overflow:hidden;min-width:320px;max-width:560px;width:92%;box-shadow:0 24px 60px rgba(0,0,0,.35)}
+.dlg .box-head{background:var(--ink);color:#fff;padding:14px 24px}
+.dlg .box-head h2{margin:0;font-size:18px;font-weight:600}
+.dlg .box.danger .box-head{background:var(--red)}
+.dlg .box.danger .box-head h2{font-weight:700;font-size:20px}
+.dlg .box-body{padding:18px 24px}
+.dlg .row{padding:6px 24px 20px;text-align:right}
+.dlg .row button{height:44px;padding:0 18px;margin-left:10px}
+.dlg .box.danger #confirm-ok{background:var(--red);color:#fff;border:none;font-weight:700}
+#confirm-ok{background:var(--blue-deep);color:#fff;border:none;font-weight:600}
+#about .kv{margin:0}
 </style>
 </head>
 <body>
 <div id="banners"></div>
 <header>
-  <h1>AEOS Door Console</h1>
+  <div class="brand">
+    <svg viewBox="0 0 688 183" role="img" aria-label="IT42">
+      <path fill="#FFFFFF" fill-rule="evenodd" d="M39.9,168.9 L13.9,168.9 L13.9,14.9 L39.9,14.9 Z M224.4,39.4 L154.9,39.4 L154.9,168.4 L127.9,168.4 L127.9,39.4 L58.4,39.4 L58.4,13.9 L224.4,13.9 Z"></path>
+      <path fill="#4B8BFF" fill-rule="evenodd" d="M271.9,14.9 L271.9,91.4 L281.4,100.9 L429.4,100.9 L429.4,15.4 L455.4,15.4 L455.4,168.4 L428.4,168.4 L428.4,124.9 L265.9,124.9 L244.9,103.9 L244.9,14.9 Z M477.4,14.9 L652.5,14.9 L674.5,37.4 L674.5,82.9 L653.0,104.9 L511.4,104.9 L503.9,112.4 L503.9,143.4 L667.5,143.4 L671.5,147.4 L671.5,168.4 L476.9,168.4 L476.9,103.9 L500.9,79.9 L640.0,79.9 L649.0,70.9 L649.0,48.4 L639.0,38.4 L477.4,38.4 Z"></path>
+    </svg>
+    <span class="vsep"></span>
+    <div class="brand-text"><h1>DoorKeeper</h1><span class="sub">Door console for access control systems</span></div>
+  </div>
   <span id="aeos-url"></span>
+  <span class="grow"></span>
   <span id="lic-chip" class="chip"></span>
   <span id="login-box">
     <input type="text" id="user" placeholder="AEOS user" autocomplete="off">
@@ -2156,6 +2224,7 @@ pre{background:#101820;color:#d8e4f0;padding:10px;overflow:auto;max-height:480px
   </span>
   <span id="logout-box" style="display:none"><span id="login-state"></span> <button id="btn-logout">Log out</button></span>
   <span id="login-msg"></span>
+  <button id="btn-about" type="button">About</button>
 </header>
 <nav>
   <button class="tab active" data-tab="doors">Doors</button>
@@ -2166,19 +2235,27 @@ pre{background:#101820;color:#d8e4f0;padding:10px;overflow:auto;max-height:480px
 </nav>
 
 <div class="panel active" id="tab-doors">
-  <button id="btn-load-doors">Load doors</button>
-  <button id="btn-refresh-state" style="display:none">Refresh state</button>
-  <input type="text" id="door-filter" placeholder="Filter doors">
+  <div class="toolbar">
+    <button id="btn-load-doors" class="primary">Load doors</button>
+    <button id="btn-refresh-state" style="display:none"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-2.64-6.36"></path><polyline points="21 3 21 9 15 9"></polyline></svg>Refresh state</button>
+    <input type="text" id="door-filter" placeholder="Filter doors">
+    <span id="door-counts"></span>
+  </div>
   <div class="msg" id="doors-msg"></div>
-  <div id="batch-bar" style="display:none"><b id="batch-count">0 selected</b> <span id="batch-buttons"></span> <button id="btn-lockdown" class="lockdown">Lockdown</button></div>
+  <div id="batch-bar" style="display:none"><b id="batch-count">0 selected</b> <span id="batch-buttons"></span> <button id="btn-lockdown" class="lockdown"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="11" width="18" height="11" rx="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg>Lockdown</button></div>
   <table><thead id="doors-head"></thead><tbody id="doors-body"></tbody></table>
 </div>
 
 <div class="panel" id="tab-setup">
-  <fieldset id="fs-license"><legend>License</legend>
+  <fieldset id="fs-license"><h2>License</h2>
     <p id="lic-status"></p>
     <div id="lic-details"></div>
-    <p>AEOS host to send to your supplier for a license: <b id="lic-host"></b> <button id="btn-copy-host" type="button">Copy</button></p>
+    <div class="kv">
+      <span class="k">AEOS host of this console (send it to your supplier)</span>
+      <span><b id="lic-host"></b> <button id="btn-copy-host" type="button">Copy</button></span>
+      <span class="k">Doors in the list</span><span id="lic-doors">0</span>
+      <span class="k">Product version</span><span id="lic-version"></span>
+    </div>
     <p><label><span>License file (license.json)</span><input type="file" id="lic-file" accept=".json,application/json"></label>
     <button id="btn-import-license" type="button">Import license file</button></p>
     <div class="msg" id="lic-msg"></div>
@@ -2256,9 +2333,21 @@ pre{background:#101820;color:#d8e4f0;padding:10px;overflow:auto;max-height:480px
   <pre id="debug-out"></pre>
 </div>
 
-<div id="confirm" role="dialog" aria-modal="true">
-  <div class="box"><div id="confirm-msg"></div>
-  <div class="row"><button id="confirm-cancel">Cancel</button> <button id="confirm-ok">OK</button></div></div>
+<div id="confirm" class="dlg" role="dialog" aria-modal="true" aria-labelledby="confirm-title">
+  <div class="box" id="confirm-box"><div class="box-head"><h2 id="confirm-title">Please confirm</h2></div>
+  <div class="box-body"><div id="confirm-msg"></div></div>
+  <div class="row"><button id="confirm-cancel">Cancel</button><button id="confirm-ok">OK</button></div></div>
+</div>
+
+<div id="about" class="dlg" role="dialog" aria-modal="true" aria-labelledby="about-title">
+  <div class="box"><div class="box-head"><h2 id="about-title">About DoorKeeper</h2></div>
+  <div class="box-body"><div class="kv">
+    <span class="k">Product</span><span id="about-product">DoorKeeper</span>
+    <span class="k">Version</span><span id="about-version"></span>
+    <span class="k">License</span><span id="about-license"></span>
+    <span class="k">Made by</span><span>IT42 d.o.o. - it42.hr</span>
+  </div></div>
+  <div class="row"><button id="about-close">Close</button></div></div>
 </div>
 
 <script>
@@ -2306,14 +2395,30 @@ function download(path,fname){
 }
 
 /* ---- confirm dialog (no alert/confirm) ---- */
-function confirmDialog(msg){
+function confirmDialog(msg,opts){
+  opts=opts||{};
   return new Promise(function(res){
-    var d=$('confirm');$('confirm-msg').textContent=msg;d.style.display='flex';$('confirm-ok').focus();
+    var d=$('confirm');$('confirm-msg').textContent=msg;
+    $('confirm-title').textContent=opts.title||'Please confirm';
+    $('confirm-ok').textContent=opts.ok||'OK';
+    $('confirm-box').className='box'+(opts.danger?' danger':'');
+    d.style.display='flex';$('confirm-ok').focus();
     function done(v){d.style.display='none';$('confirm-ok').onclick=null;$('confirm-cancel').onclick=null;res(v);}
     $('confirm-ok').onclick=function(){done(true);};
     $('confirm-cancel').onclick=function(){done(false);};
   });
 }
+
+/* ---- about ---- */
+function openAbout(){
+  var v=document.querySelector('meta[name="console-version"]');
+  $('about-version').textContent=v?v.getAttribute('content'):'';
+  $('about-license').textContent=licLine();
+  $('about').style.display='flex';$('about-close').focus();
+}
+$('btn-about').onclick=openAbout;
+$('about-close').onclick=function(){$('about').style.display='none';};
+$('about').onclick=function(e){if(e.target===$('about')){$('about').style.display='none';}};
 
 /* ---- tabs ---- */
 function showTab(name){
@@ -2348,6 +2453,17 @@ function renderBanners(){
 /* ---- license ---- */
 function licBlocked(){return !!(LIC&&!LIC.actionsAllowed);}
 function licTip(){return licBlocked()?('Switched off: '+LIC.reason):'';}
+var SVG_O='<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">';
+var ICON_OK=SVG_O+'<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path><path d="M9 12l2 2 4-4"></path></svg>';
+var ICON_CLOCK=SVG_O+'<circle cx="12" cy="12" r="10"></circle><polyline points="12 6 12 12 16 14"></polyline></svg>';
+var ICON_BAD=SVG_O+'<circle cx="12" cy="12" r="10"></circle><line x1="15" y1="9" x2="9" y2="15"></line><line x1="9" y1="9" x2="15" y2="15"></line></svg>';
+var STATE_ICONS={
+  locked:SVG_O+'<rect x="3" y="11" width="18" height="11" rx="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg>',
+  unlocked:SVG_O+'<rect x="3" y="11" width="18" height="11" rx="2"></rect><path d="M7 11V7a5 5 0 0 1 9.9-1"></path></svg>',
+  normal:ICON_OK,
+  unknown:SVG_O+'<circle cx="12" cy="12" r="10"></circle><path d="M9.1 9a3 3 0 0 1 5.8 1c0 2-3 3-3 3"></path><line x1="12" y1="17" x2="12.01" y2="17"></line></svg>'
+};
+function stateKind(label){var l=String(label||'').toLowerCase();return (l==='locked'||l==='unlocked'||l==='normal')?l:'unknown';}
 function chipText(){
   if(!LIC){return '';}
   if(LIC.state==='trial'){return 'Trial - '+LIC.daysLeft+' day'+(LIC.daysLeft===1?'':'s')+' left';}
@@ -2355,14 +2471,24 @@ function chipText(){
   if(LIC.state==='expired'){return LIC.details?'License expired':'Trial ended';}
   return 'License invalid';
 }
+// One status line: a trial's reason only repeats the chip ("N day(s) left"), so it is left out there.
+function licLine(){
+  if(!LIC){return 'License status unknown.';}
+  return LIC.state==='trial'?(chipText()+'.'):(chipText()+'. '+LIC.reason);
+}
 function renderLicense(){
   var chip=$('lic-chip');
   if(LIC){
-    chip.textContent=chipText();
+    chip.innerHTML=(LIC.state==='licensed'?ICON_OK:(LIC.state==='trial'?ICON_CLOCK:ICON_BAD));
+    chip.appendChild(document.createTextNode(chipText()));
     chip.className='chip '+(LIC.state==='licensed'?'chip-ok':(LIC.state==='trial'?'chip-trial':'chip-bad'));
-    chip.style.display='inline-block';chip.title=LIC.reason;
+    chip.style.display='inline-flex';chip.title=LIC.reason;
   }
-  $('lic-status').textContent=LIC?(chipText()+'. '+LIC.reason):'License status unknown.';
+  var ls=$('lic-status');
+  ls.className=LIC?(LIC.state==='licensed'?'lic-ok':(LIC.state==='trial'?'':'lic-bad')):'';
+  ls.textContent=licLine();
+  $('lic-doors').textContent=String(DOORS.length);
+  (function(){var v=document.querySelector('meta[name="console-version"]');$('lic-version').textContent=v?v.getAttribute('content'):'';})();
   var d=$('lic-details');d.innerHTML='';
   if(LIC&&LIC.state==='licensed'&&LIC.details){
     var t=LIC.details;
@@ -2432,11 +2558,25 @@ function setRowResult(id,cls,text,rid){
   var row=rowOf(id);if(row){paintResult(row.querySelector('td.result'),RES[id]);}
 }
 function paintState(td,st){
-  td.textContent=st.state;td.title=st.detail||'';td.className='state'+(st.state==='?'?' unknown':'');
+  var k=stateKind(st.state);
+  td.title=st.detail||'';td.className='state'+(st.state==='?'?' unknown':'');
+  td.innerHTML='';
+  var c=h('span',{class:'schip s-'+k});c.innerHTML=STATE_ICONS[k];c.appendChild(document.createTextNode(st.state));
+  td.appendChild(c);
 }
 function setState(id,state,detail){
   STATES[id]={state:state,detail:detail};
   var row=rowOf(id);if(row){paintState(row.querySelector('td.state'),STATES[id]);}
+  renderCounts();
+}
+function renderCounts(){
+  var box=$('door-counts');box.innerHTML='';
+  if(!DOORS.length){return;}
+  box.appendChild(h('span',{text:DOORS.length+' doors'}));
+  if(!stateOn()){return;}
+  var n={locked:0,unlocked:0,normal:0,unknown:0};
+  DOORS.forEach(function(d){var st=STATES[d.id];n[st?stateKind(st.state):'unknown']+=1;});
+  ['locked','unlocked','normal','unknown'].forEach(function(k){box.appendChild(h('span',{class:'s-'+k,text:n[k]+' '+k}));});
 }
 function updateBatchBar(){
   var sel=selectedDoors().length;
@@ -2446,6 +2586,8 @@ function updateBatchBar(){
   $('btn-lockdown').style.display=isMapped(CFG&&CFG.actions.lock)?'':'none';
   $('btn-lockdown').disabled=BATCH_BUSY||!DOORS.length||licBlocked();$('btn-lockdown').title=licTip();
   $('btn-refresh-state').style.display=stateOn()?'':'none';
+  Array.prototype.forEach.call($('doors-body').children,function(r){r.classList.toggle('picked',!!SEL[r.getAttribute('data-id')]);});
+  renderCounts();
   var vis=visibleDoors();var sa=$('sel-all');
   if(sa){sa.checked=vis.length>0&&vis.every(function(d){return SEL[d.id];});}
 }
@@ -2528,10 +2670,10 @@ function refreshStates(doors){
   }).then(function(){$('btn-refresh-state').disabled=false;});
 }
 /* One action on many doors: one request, one socket session on the server (the page waits for the whole batch). */
-function runBatch(a,doors,question){
+function runBatch(a,doors,question,opts){
   if(!doors.length||BATCH_BUSY){return;}
   var names=doors.slice(0,5).map(function(d){return d.name;}).join(', ')+(doors.length>5?', ...':'');
-  confirmDialog(question+' First '+Math.min(5,doors.length)+': '+names).then(function(ok){
+  confirmDialog(question+' First '+Math.min(5,doors.length)+': '+names,opts).then(function(ok){
     if(!ok){return;}
     BATCH_BUSY=true;updateBatchBar();
     doors.forEach(function(d){setRowResult(d.id,'','working on '+doors.length+' doors...');});
@@ -2551,7 +2693,7 @@ function runBatch(a,doors,question){
 $('btn-refresh-state').onclick=function(){refreshStates(visibleDoors());};
 $('btn-lockdown').onclick=function(){
   var def=CFG.actions.lock;
-  runBatch('lock',DOORS.slice(),'LOCKDOWN: '+((def&&def.label)||'lock')+' ALL '+DOORS.length+' door(s) in the list?');
+  runBatch('lock',DOORS.slice(),'LOCKDOWN: '+((def&&def.label)||'lock')+' ALL '+DOORS.length+' door(s) in the list?',{danger:true,title:'Lockdown',ok:'Lock all doors'});
 };
 $('btn-load-doors').onclick=function(){
   setMsg('doors-msg','Loading...');
@@ -2753,7 +2895,7 @@ function loadDebug(){
   }).catch(function(e){setMsg('debug-msg',errText(e),'bad');});
 }
 $('btn-dl-log').onclick=function(){
-  download('/api/v1/debuglog/download','aeos-console-debug.log').catch(function(e){setMsg('debug-msg','Download failed: '+e.message,'bad');});
+  download('/api/v1/debuglog/download','doorkeeper-debug.log').catch(function(e){setMsg('debug-msg','Download failed: '+e.message,'bad');});
 };
 $('btn-diag').onclick=function(){
   setMsg('debug-msg','Creating diagnostics zip...');
@@ -2786,7 +2928,11 @@ api('GET','/api/v1/config').then(function(c){
 # ============================================================================
 
 function Start-Console {
-    if (-not $ConfigFile) { $script:ConfigPath = Join-Path $script:ScriptDir 'aeos-console.json' }
+    if (-not $ConfigFile) {
+        $script:ConfigPath = Join-Path $script:ScriptDir 'doorkeeper.json'
+        $oldCfg = Join-Path $script:ScriptDir 'aeos-console.json'
+        if (-not (Test-Path -LiteralPath $script:ConfigPath) -and (Test-Path -LiteralPath $oldCfg)) { $script:ConfigPath = $oldCfg }
+    }
     else { $script:ConfigPath = [System.IO.Path]::GetFullPath($ConfigFile) }
     $script:Port = $Port
     $script:Cred = $null
@@ -2817,7 +2963,7 @@ function Start-Console {
         Write-Host 'Is another copy running? Use -Port to pick another port.'
         exit 1
     }
-    Write-Host ('AEOS Door Console ' + $script:Version + ' listening on ' + $url + '  (Ctrl+C stops it)')
+    Write-Host ('DoorKeeper ' + $script:Version + ' listening on ' + $url + '  (Ctrl+C stops it)')
     Write-Host ('Config:    ' + $script:ConfigPath)
     Write-Host ('Debug log: ' + $script:DebugLogPath)
     Write-Host ('Audit:     ' + $script:AuditPath)
