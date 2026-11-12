@@ -85,6 +85,25 @@ their request fields and allowed values, whatever the operation is called (add `
 `-AskCredential` if the WSDL needs the AEOS login.
 The output is also saved as `aeos-wsdl-<time>.txt` next to the script - send that file back when asking for help.
 
+## Door commands over the socket interface: Aeos-SocketTest.ps1
+
+AEOS's SOAP service lists the doors (`findAccessPoint` returns each access point's `Name` and `HostName`) but has no
+lock or unlock operation. Door commands go through the AEOS socket interface (TCP 8035), which the Milestone Nedap
+plugin also uses; the AEOS log shows them as `execute(<function>,"<HostName>:<Name>");` with the functions `lock`,
+`unlock`, `normal` (access control activated), `provideAccess`, `isLocked` and `isUnlocked`.
+
+`Aeos-SocketTest.ps1` connects once, logs in, sends `setRmiCommandConnection(true);` and ONE function, and prints
+every byte AEOS sends back (control characters shown as `<CR>` `<LF>` `<ETX>`), saved as `aeos-socket-<time>.txt`:
+
+```
+powershell -ExecutionPolicy Bypass -File .\Aeos-SocketTest.ps1 -AeosHost <aeos-server> -AccessPoint "<HostName>:<Name>"
+```
+
+The default function `isLocked` only asks for the state. `-Function lock|unlock|normal|provideAccess` changes the
+door and asks for YES first. `-UseExecuteArgs` sends `executeArgs(<function>,[],"<HostName>:<Name>");` instead,
+`-Terminator LF|None` changes what follows each `;` (default CR LF). The password is never printed or saved, but the
+socket interface is plain TCP, so it crosses the network unencrypted (as for every socket client).
+
 ## Tabs
 
 - **Doors**: load, filter, and run the mapped actions. Each row shows the result and a **request id**.
