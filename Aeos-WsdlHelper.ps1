@@ -26,29 +26,64 @@ param(
     [pscredential]$Credential                                       # or pass one (when called from a PowerShell session)
 )
 $ErrorActionPreference = 'Stop'
+# Same connection settings as Aeos-DoorConsole.ps1 (proven against AEOS): TLS 1.2, no proxy, no keep-alive,
+# a compiled per-request certificate callback (a PowerShell scriptblock callback is not reliable there).
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-if ($SkipTlsCheck) { [Net.ServicePointManager]::ServerCertificateValidationCallback = { $true } }
+if (-not ('AeosHelperTls' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System.Net.Security;
+using System.Security.Cryptography.X509Certificates;
+public static class AeosHelperTls
+{
+    public static bool Skip;
+    public static string Last = "";
+    public static RemoteCertificateValidationCallback Callback
+    {
+        get { return new RemoteCertificateValidationCallback(Validate); }
+    }
+    private static bool Validate(object sender, X509Certificate cert, X509Chain chain, SslPolicyErrors errors)
+    {
+        Last = "server certificate " + (cert == null ? "(none)" : cert.Subject) + ", errors: " + errors;
+        return Skip || errors == SslPolicyErrors.None;
+    }
+}
+'@
+}
+[AeosHelperTls]::Skip = [bool]$SkipTlsCheck
 $script:Cred = $Credential
 if ($AskCredential) { $script:Cred = Get-Credential -Message 'AEOS user' }
 if (-not $WsdlUrl) { $WsdlUrl = $AeosUrl.TrimEnd('/') + '?wsdl' }
 
 function Get-Xml([string]$Url) {
-    $p = @{ Uri = $Url; UseBasicParsing = $true }
+    $uri = [uri]$Url
+    if ($uri.Scheme -eq 'file') { return [xml]([IO.File]::ReadAllText($uri.LocalPath)).TrimStart([char]0xFEFF) }
+    $req = [System.Net.HttpWebRequest][System.Net.WebRequest]::Create($uri)
+    $req.Method = 'GET'
+    $req.Proxy = $null
+    $req.KeepAlive = $false
+    $req.Timeout = 60000
+    $req.ReadWriteTimeout = 60000
+    $req.UserAgent = 'Aeos-WsdlHelper'
+    if ($uri.Scheme -eq 'https') { $req.ServerCertificateValidationCallback = [AeosHelperTls]::Callback }
     if ($script:Cred) {
-        # HTTP Basic sent up front (PowerShell 5.1 -Credential only answers a challenge). Kept in memory only.
+        # HTTP Basic sent up front. The password stays in memory only.
         $nc = $script:Cred.GetNetworkCredential()
-        $p.Headers = @{ Authorization = 'Basic ' + [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($nc.UserName + ':' + $nc.Password)) }
+        $req.Headers['Authorization'] = 'Basic ' + [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($nc.UserName + ':' + $nc.Password))
     }
-    try {
-        $c = (Invoke-WebRequest @p).Content
-        if ($c -is [byte[]]) { $c = [Text.Encoding]::UTF8.GetString($c) }   # served without a text content type
-        [xml]([string]$c).TrimStart([char]0xFEFF)
-    }
+    [AeosHelperTls]::Last = ''
+    try { $resp = $req.GetResponse() }
     catch {
-        $code = 0; try { $code = [int]$_.Exception.Response.StatusCode } catch {}
+        $ex = $_.Exception; while ($ex -is [System.Management.Automation.MethodInvocationException] -and $ex.InnerException) { $ex = $ex.InnerException }
+        $code = 0; try { $code = [int]$ex.Response.StatusCode } catch {}
         if ($code -eq 401) { throw "$Url answered 401 Unauthorized - run again with -AskCredential and the AEOS user." }
-        throw "$Url could not be read: $($_.Exception.Message)$(if(-not $SkipTlsCheck){' (self-signed AEOS certificate? add -SkipTlsCheck)'})"
+        $m = $ex.Message; $ie = $ex.InnerException; while ($ie) { $m += ' -> ' + $ie.Message; $ie = $ie.InnerException }
+        if ([AeosHelperTls]::Last) { $m += ' [TLS: ' + [AeosHelperTls]::Last + ']' }
+        if ($uri.Scheme -eq 'https' -and -not $SkipTlsCheck) { $m += ' (self-signed AEOS certificate? add -SkipTlsCheck)' }
+        throw "$Url could not be read: $m"
     }
+    try { $sr = New-Object IO.StreamReader($resp.GetResponseStream(), [Text.Encoding]::UTF8); $text = $sr.ReadToEnd(); $sr.Close() }
+    finally { $resp.Close() }
+    [xml]$text.TrimStart([char]0xFEFF)
 }
 function Get-LocalName([string]$Q) { if ($Q) { $Q -replace '^.*:', '' } else { '' } }
 function Test-BuiltinType([string]$Q) { $Q -match '^(xs|xsd|s|xsi):' }
