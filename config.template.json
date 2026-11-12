@@ -1,0 +1,19 @@
+{
+  "aeosUrl": "",
+  "wsdlUrl": "",
+  "soapVersion": "1.1",
+  "auth": "basic",
+  "tlsSkipValidation": false,
+  "timeoutSec": 30,
+  "namespacePrefix": "aeos",
+  "targetNamespace": "",
+  "auditFile": "",
+  "debugLogFile": "",
+  "debugLevel": "full",
+  "actions": {
+    "listDoors": { "operation": "", "soapAction": "", "body": "", "itemElement": "", "idField": "", "nameField": "", "extraFields": [] },
+    "lock":   { "label": "Lock",           "operation": "", "soapAction": "", "body": "", "confirm": true },
+    "unlock": { "label": "Unlock",         "operation": "", "soapAction": "", "body": "", "confirm": true },
+    "access": { "label": "Provide access", "operation": "", "soapAction": "", "body": "", "confirm": true }
+  }
+}
