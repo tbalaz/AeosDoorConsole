@@ -53,9 +53,14 @@ public static class AeosHelperTls
 $script:Cred = $Credential
 if ($AskCredential) { $script:Cred = Get-Credential -Message 'AEOS user' }
 if (-not $WsdlUrl) { $WsdlUrl = $AeosUrl.TrimEnd('/') + '?wsdl' }
+# Only the WSDL's own server is ever contacted: imports from another server or a UNC share are skipped, and the
+# login is sent to that server only (a tampered WSDL must not pull credentials or NTLM logons elsewhere).
+$script:Origin = ([uri]$WsdlUrl).GetLeftPart([UriPartial]::Authority)
+function Test-SameOrigin([uri]$U) { (-not $U.IsUnc) -and ($U.GetLeftPart([UriPartial]::Authority) -eq $script:Origin) }
 
 function Get-Xml([string]$Url) {
     $uri = [uri]$Url
+    if (-not (Test-SameOrigin $uri)) { throw "$Url is not on the WSDL's server ($script:Origin) - not read." }
     if ($uri.Scheme -eq 'file') { return [xml]([IO.File]::ReadAllText($uri.LocalPath)).TrimStart([char]0xFEFF) }
     $req = [System.Net.HttpWebRequest][System.Net.WebRequest]::Create($uri)
     $req.Method = 'GET'
@@ -95,7 +100,8 @@ function Add-Imports([xml]$Doc, [string]$BaseUrl) {
     foreach ($n in @($Doc.SelectNodes("//*[local-name()='import' or local-name()='include']"))) {
         $loc = $n.GetAttribute('schemaLocation'); if (-not $loc) { $loc = $n.GetAttribute('location') }
         if (-not $loc) { continue }
-        $abs = ([uri]::new([uri]$BaseUrl, $loc)).AbsoluteUri
+        $absUri = [uri]::new([uri]$BaseUrl, $loc); $abs = $absUri.AbsoluteUri
+        if (-not (Test-SameOrigin $absUri)) { "  (skipped import from another server or share: $abs)"; continue }
         if ($script:Seen.ContainsKey($abs) -or $script:Seen.Count -ge 30) { continue }
         $script:Seen[$abs] = $true
         try { $d = Get-Xml $abs; $script:Docs.Add($d); Add-Imports $d $abs }
