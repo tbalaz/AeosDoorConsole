@@ -90,7 +90,7 @@ The output is also saved as `aeos-wsdl-<time>.txt` next to the script - send tha
 AEOS's SOAP service lists the doors (`findAccessPoint` returns each access point's `Name` and `HostName`) but has no
 lock or unlock operation. Door commands go through the AEOS socket interface (TCP 8035), which the Milestone Nedap
 plugin also uses; the AEOS log shows them as `execute(<function>,"<HostName>:<Name>");` with the functions `lock`,
-`unlock`, `normal` (access control activated), `provideAccess`, `isLocked` and `isUnlocked`.
+`unlock`, `normal` (access control activated), `provideAccess`, `isLocked` and `isUnlocked` (`lock` assumed).
 
 `Aeos-SocketTest.ps1` connects once, logs in, sends `setRmiCommandConnection(true);` and ONE function, and prints
 every byte AEOS sends back (control characters shown as `<CR>` `<LF>` `<ETX>`), saved as `aeos-socket-<time>.txt`:
@@ -101,8 +101,12 @@ powershell -ExecutionPolicy Bypass -File .\Aeos-SocketTest.ps1 -AeosHost <aeos-s
 
 The default function `isLocked` only asks for the state. `-Function lock|unlock|normal|provideAccess` changes the
 door and asks for YES first. `-UseExecuteArgs` sends `executeArgs(<function>,[],"<HostName>:<Name>");` instead,
-`-Terminator LF|None` changes what follows each `;` (default CR LF). The password is never printed or saved, but the
-socket interface is plain TCP, so it crosses the network unencrypted (as for every socket client).
+`-Terminator LF|None` changes what follows each `;` (default CR LF). The password is never printed or saved.
+
+The connection is TLS 1.2 by default: an AEOS 2023.2 socket interface answered a plain-text login with a TLS alert
+(bytes `15 03 03 00 02 02 0A`) and closed it. Add `-SkipTlsCheck` for a self-signed AEOS certificate (the
+certificate is always logged). `-Plain` is only for a socket interface without TLS; the password then crosses the
+network unencrypted.
 
 ## Tabs
 
