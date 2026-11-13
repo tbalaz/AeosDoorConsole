@@ -2441,6 +2441,10 @@ button{font:inherit;cursor:pointer;height:36px;padding:0 14px;background:#fff;co
 button:hover{filter:brightness(.96)}
 button.primary{background:var(--blue-deep);color:#fff;border:none;font-weight:600;height:40px;padding:0 16px}
 button.act{margin-right:6px;height:30px;padding:0 10px;font-size:13px}
+.pager{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:8px 0;font-size:13px}
+.pager button{height:30px;padding:0 10px;font-size:13px}
+.pager select{height:30px}
+.pager button.pg-link{border:none;background:none;color:var(--blue-dark);text-decoration:underline;padding:0 4px}
 button:disabled{opacity:.5;cursor:default}
 button svg{vertical-align:-3px;margin-right:6px}
 .result.ok{color:#0a6b2a;font-weight:600}
@@ -2582,7 +2586,7 @@ button.arm-btn{height:26px;padding:0 8px;font-size:12px}
         <div id="loc-filter-note" style="display:none"><span id="loc-filter-text"></span> <button id="loc-filter-clear" type="button">Show all doors</button></div>
         <div id="loc-tree"></div></div>
     </aside>
-    <div id="doors-main"><table><thead id="doors-head"></thead><tbody id="doors-body"></tbody></table></div>
+    <div id="doors-main"><div id="pager-top" class="pager" style="display:none"></div><table><thead id="doors-head"></thead><tbody id="doors-body"></tbody></table><div id="pager-bottom" class="pager" style="display:none"></div></div>
   </div>
 </div>
 
@@ -2699,6 +2703,9 @@ var ACTIONS=['listDoors','lock','unlock','access','normal'];
 var DOOR_ACTIONS=['lock','unlock','access','normal'];
 var CFG=null,LIC=null,OPS=[],DOORS=[],debugTimer=null,SEL={},STATES={},RES={},BATCH_BUSY=false,DS_ROWS=4;
 var PLACE={},NODES={},TREE_DOORS=null,TREE_LOC='',LOCFILTER='',ARMREP=null;
+/* Doors table pager: PAGESIZE 0 = all rows; kept per browser (the page works without storage) */
+var PAGE_SIZES=[25,50,100,250,500,0],PAGE=1,PAGEKEY='',PAGEROWS=[];
+var PAGESIZE=(function(){try{var v=parseInt(localStorage.getItem('dk-rows-per-page'),10);if(PAGE_SIZES.indexOf(v)>=0){return v;}}catch(e){}return 100;})();
 function $(id){return document.getElementById(id);}
 function h(tag,attrs,kids){
   var e=document.createElement(tag);
@@ -3005,9 +3012,49 @@ function updateBatchBar(){
   $('btn-refresh-state').style.display=stateOn()?'':'none';
   Array.prototype.forEach.call($('doors-body').children,function(r){r.classList.toggle('picked',!!SEL[r.getAttribute('data-id')]);});
   renderCounts();
-  var vis=visibleDoors();var sa=$('sel-all');
-  if(sa){sa.checked=vis.length>0&&vis.every(function(d){return SEL[d.id];});}
+  var sa=$('sel-all');
+  if(sa){sa.checked=PAGEROWS.length>0&&PAGEROWS.every(function(d){return SEL[d.id];});}
+  paintPagerSel();
   paintArm(sel);
+}
+function renderPager(total,pages){
+  ['top','bottom'].forEach(function(w){
+    var box=$('pager-'+w);box.innerHTML='';
+    if(!DOORS.length){box.style.display='none';return;}
+    box.style.display='';
+    var s=(w==='top')?'':'-b';
+    var first=total?(PAGESIZE?(PAGE-1)*PAGESIZE+1:1):0;
+    var last=PAGESIZE?Math.min(PAGE*PAGESIZE,total):total;
+    function go(p){return function(){PAGE=p;renderDoors();if(w==='bottom'){$('doors-main').scrollIntoView({block:'start'});}};}
+    function btn(id,text,p,off){var b=h('button',{type:'button',id:id+s,text:text});b.onclick=go(p);b.disabled=off;return b;}
+    box.appendChild(btn('pg-first','First',1,PAGE<=1));
+    box.appendChild(btn('pg-prev','Previous',PAGE-1,PAGE<=1));
+    box.appendChild(h('span',{id:'pg-info'+s,text:'Doors '+first+'-'+last+' of '+total+', page '+PAGE+' of '+pages}));
+    box.appendChild(btn('pg-next','Next',PAGE+1,PAGE>=pages));
+    box.appendChild(btn('pg-last','Last',pages,PAGE>=pages));
+    if(w==='top'){
+      var sel=h('select',{id:'pg-size'});
+      PAGE_SIZES.forEach(function(n){var o=h('option',{value:String(n),text:n?String(n):'All'});o.selected=(n===PAGESIZE);sel.appendChild(o);});
+      sel.onchange=function(){PAGESIZE=parseInt(sel.value,10)||0;try{localStorage.setItem('dk-rows-per-page',String(PAGESIZE));}catch(e){}PAGE=1;renderDoors();};
+      box.appendChild(h('label',null,['Rows per page ',sel]));
+      box.appendChild(h('span',{id:'pg-selnote'}));
+    }
+  });
+}
+function paintPagerSel(){
+  var box=$('pg-selnote');if(!box){return;}
+  box.innerHTML='';
+  var vis=visibleDoors();
+  if(!PAGEROWS.length||vis.length<=PAGEROWS.length){return;}
+  function link(id,text,on){var b=h('button',{type:'button',id:id,'class':'pg-link',text:text});b.onclick=function(){vis.forEach(function(d){SEL[d.id]=on;});renderDoors();};return b;}
+  if(vis.every(function(d){return SEL[d.id];})){
+    box.appendChild(h('span',{text:'All '+vis.length+' doors in the list are selected.'}));
+    box.appendChild(link('pg-clear','Clear selection',false));
+  }
+  else if(PAGEROWS.every(function(d){return SEL[d.id];})){
+    box.appendChild(h('span',{text:'All '+PAGEROWS.length+' doors on this page are selected.'}));
+    box.appendChild(link('pg-selall','Select all '+vis.length+' in the list',true));
+  }
 }
 /* ---- arming: Arm = arming.armAction, Disarm = arming.disarmAction (door actions of the Setup tab) ---- */
 function armInfo(kind){
@@ -3175,14 +3222,14 @@ function renderDoors(){
   $('loc-side').style.display=(DOORS.length&&(levels.length||((CFG&&CFG.groups)||[]).length))?'':'none';
   $('loc-tree-box').style.display=levels.length?'':'none';
   var head=$('doors-head');head.innerHTML='';
-  var selAll=h('input',{type:'checkbox',id:'sel-all',title:'Select all shown doors'});
+  var selAll=h('input',{type:'checkbox',id:'sel-all',title:'Select all doors on this page'});
   var tr=h('tr',null,[h('th',null,[selAll]),h('th',{text:'Name'}),h('th',{text:'Id'})]);
   extras.forEach(function(x){tr.appendChild(h('th',{text:x}));});
   levels.forEach(function(x){tr.appendChild(h('th',{'class':'loc-th','data-level':x,text:x}));});
   if(stateOn()){tr.appendChild(h('th',{text:'State'}));}
   tr.appendChild(h('th',{text:'Actions'}));tr.appendChild(h('th',{text:'Result'}));head.appendChild(tr);
   selAll.onchange=function(){
-    visibleDoors().forEach(function(d){
+    PAGEROWS.forEach(function(d){
       SEL[d.id]=selAll.checked;
       var row=rowOf(d.id);if(row){row.querySelector('input.sel').checked=selAll.checked;}
     });
@@ -3198,8 +3245,16 @@ function renderDoors(){
     };
     bb.appendChild(b);
   });
+  var vis=visibleDoors();
+  var key=$('door-filter').value+'|'+LOCFILTER;
+  if(key!==PAGEKEY){PAGEKEY=key;PAGE=1;}
+  var pages=PAGESIZE?Math.max(1,Math.ceil(vis.length/PAGESIZE)):1;
+  if(PAGE>pages){PAGE=pages;}
+  if(PAGE<1){PAGE=1;}
+  PAGEROWS=PAGESIZE?vis.slice((PAGE-1)*PAGESIZE,PAGE*PAGESIZE):vis;
+  renderPager(vis.length,pages);
   var body=$('doors-body');body.innerHTML='';
-  visibleDoors().forEach(function(d){
+  PAGEROWS.forEach(function(d){
     var cb=h('input',{type:'checkbox','class':'sel','data-id':d.id});
     cb.checked=!!SEL[d.id];
     cb.onchange=function(){SEL[d.id]=cb.checked;updateBatchBar();};
@@ -3304,7 +3359,7 @@ $('btn-lockdown').onclick=function(){
 $('btn-load-doors').onclick=function(){
   setMsg('doors-msg','Loading...');
   api('GET','/api/v1/doors').then(function(r){
-    DOORS=r.doors||[];SEL={};STATES={};RES={};LOCFILTER='';ARMREP=null;$('arm-report').style.display='none';renderDoors();updateLocTest();loadLicense();
+    DOORS=r.doors||[];SEL={};STATES={};RES={};LOCFILTER='';PAGE=1;ARMREP=null;$('arm-report').style.display='none';renderDoors();updateLocTest();loadLicense();
     if(r.ok){
       setMsg('doors-msg',DOORS.length+' door(s) loaded (request id '+r._rid+')','good');
       if(stateOn()&&DOORS.length){return refreshStates(visibleDoors());}

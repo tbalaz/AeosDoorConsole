@@ -130,9 +130,10 @@ socket command and a match pattern (a regex on the reply line). A door's state i
 reply matches; when none matches the state is the *Label when no check matches*. A check that got no reply, or a
 door with a refused value, shows `?` and the reason in the tooltip (hover the cell). With no check typed there is no
 State column. The checks use the Socket interface settings and the same placeholders as the action commands. Nothing
-AEOS-specific is built in. State is read after *Load doors*, with the *Refresh state* button (it reads the rows
-shown, so a filter narrows it), and after a door action (same session). One refresh uses ONE socket session for all
-doors: login and init once, then the checks for every door. No timer: refresh by hand.
+AEOS-specific is built in. State is read after *Load doors*, with the *Refresh state* button (it reads every door
+in the list on all pages, so a filter narrows it), and after a door action (same session). One refresh uses ONE socket
+session per *Doors per socket session* doors: login and init once, then the checks for every door. No timer: refresh
+by hand.
 
 | Setup field (Door state) | Value for AEOS 2023.2 |
 |---|---|
@@ -145,7 +146,12 @@ UNVERIFIED on site: `isLocked` answered `Response:false;` on a real AEOS 2023.2;
 `isUnlocked` query have not been tried yet. Try them with the **Raw call** tab socket box on a locked and an unlocked
 door first, and adjust the match patterns to what AEOS really answers.
 
-**Selection and batch.** Every door row has a checkbox; the header checkbox selects all shown rows. The batch bar
+**Pages.** The table shows *Rows per page* doors (25, 50, 100, 250, 500 or All; default 100, remembered by the
+browser) with First / Previous / Next / Last above and below it and "Doors 1-100 of 1893, page 1 of 19". The pages
+cover the doors the filter box and the location tree leave; a new filter, tree node or door list starts at page 1.
+
+**Selection and batch.** Every door row has a checkbox; the header checkbox selects the doors on
+the page. With the whole page ticked, the pager offers *Select all N in the list* (and then *Clear selection*). The batch bar
 shows the count and one button per mapped action ("Lock selected" ...); each asks for confirmation naming the number
 of doors and the first five names. Over the socket the whole batch is ONE session: login and init once, one command
 per door, then the state checks of every door. A door with a refused value (see above) is reported "refused, not
