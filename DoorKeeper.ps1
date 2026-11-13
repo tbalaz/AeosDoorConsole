@@ -27,16 +27,34 @@
 .PARAMETER NoBrowser
     Do not open the default browser.
 
+.PARAMETER InternalPort
+    Only with -BehindProxy. The port DoorKeeper's own listener (HttpListener, HTTP.sys) binds on http://localhost:<InternalPort>/
+    (default 8765). -Port is then the port IIS HttpPlatformHandler gives the child (%HTTP_PLATFORM_PORT%): DoorKeeper binds it with a
+    plain TCP relay on 127.0.0.1 that copies every connection to the internal listener (HttpPlatformHandler cannot start a child
+    that listens through HTTP.sys). The URL Rewrite rule of the sample web.config sets the Host header to localhost:<InternalPort>.
+
+.PARAMETER BehindProxy
+    Run behind a reverse proxy (IIS HttpPlatformHandler): session cookie is Secure, the Origin must equal -PublicUrl, the
+    forwarded client address (X-DK-Client-IP, set by the URL Rewrite rule) is read on requests from 127.0.0.1 only, and an empty admin list gives
+    nobody admin rights (the first admin is set in the config file on the server).
+
+.PARAMETER PublicUrl
+    The address operators use, for example https://doorkeeper.example.org . Required with -BehindProxy.
+
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File .\DoorKeeper.ps1
     powershell -ExecutionPolicy Bypass -File .\DoorKeeper.ps1 -Port 9000 -NoBrowser
+    powershell -NoProfile -ExecutionPolicy Bypass -File .\DoorKeeper.ps1 -Port %HTTP_PLATFORM_PORT% -InternalPort 8765 -NoBrowser -BehindProxy -PublicUrl https://doorkeeper.example.org
 #>
 [CmdletBinding()]
 param(
     [string]$ConfigFile = '',
     [string]$LicenseFile = '',
     [int]$Port = 8765,
-    [switch]$NoBrowser
+    [int]$InternalPort = 8765,
+    [switch]$NoBrowser,
+    [switch]$BehindProxy,
+    [string]$PublicUrl = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -48,6 +66,8 @@ $script:LicenseProductId = 'DoorKeeper'
 $script:LicensePublicKeyXml = '<RSAKeyValue><Modulus>0b9MUB0Iyk066tBoQ+AGwP+QeC6wncUgZjZ73U8Mb8F/i066yp90NRD3obyoxdqUNv6ZfVY8Gv9xElOk7UkTiNfMXnIrt4DUrgNC+s1Z6Ul0wvMoDFuLgK+Kwqed23aI1LVVXY6EeF5uhMe3ddTemgm7N9J56cfmPLcjciOO/s6XexmwdOBw4vvt9XUK8k26ExBdm3bAkIP6/A7DymCc8UKqAU5/ALzRkp4VTQ4AEqCKfFKfqJ4zuYofCpqujhgivFzIc/Kf6EdjIQM3C++7w6Ba3cdTmiIoL8hbDUvJeIMQhRj4aEirxC9OGnzPAtxkzdsih6j93T6iDnVRcS9D3GVxV8OZ2WeFIDOUhaR9mp1Gi2HvzH7pTyvHQ2w19RME8k1e/z5LqlNEHwpUaa03bXbeZannhIo51jzD7ZmPHHTzLtZdahyzOtVqPPbOUK5hVnAQq9gDPYvC79CkrFkZt1p1Ya1ZsZFIdeleM/G/TXdMS8nGxfAlh2r0TlxjyZRV</Modulus><Exponent>AQAB</Exponent></RSAKeyValue>'
 $script:TrialDays = 30
 # ------------------------------------------------------------------------------------------------------------------
+$script:SelfPath = $PSCommandPath
+$script:BehindProxy = [bool]$BehindProxy
 $script:ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 $script:ZeroHash = ('0' * 64)
 $script:ActionNames = @('listDoors', 'lock', 'unlock', 'access', 'normal')
@@ -423,14 +443,29 @@ function Get-SoapFault {
 }
 
 function Get-AuditHash {
-    # SHA256(prevHash|ts|windowsUser|aeosUser|action|doorId|doorName|httpStatus|ok[|batch]), hex, UTF-8.
+    # v1: SHA256(prevHash|ts|windowsUser|aeosUser|action|doorId|doorName|httpStatus|ok[|batch]), hex, UTF-8.
     # The batch part is added only when the record has one, so records from before batches keep their hash.
+    # v2 (records with "v":2): the same nine parts, then v2|batch|computer|doorAlias (batch may be empty). The version
+    # marker and the computer / alias are covered, so a v2 line cannot be passed off as v1 or have them edited.
+    # v3 (records with "v":3): the v2 parts, with the marker v3, then the client address (clientIp, as IIS forwarded it).
     param([string]$PrevHash, [string]$Ts, [string]$WindowsUser, [string]$AeosUser, [string]$Action,
-        [string]$DoorId, [string]$DoorName, [int]$HttpStatus, [bool]$Ok, [string]$Batch = '')
+        [string]$DoorId, [string]$DoorName, [int]$HttpStatus, [bool]$Ok, [string]$Batch = '',
+        [int]$Version = 1, [string]$Computer = '', [string]$DoorAlias = '', [string]$ClientIp = '', [string]$Fault = '')
     $okText = 'false'
     if ($Ok) { $okText = 'true' }
     $parts = @($PrevHash, $Ts, $WindowsUser, $AeosUser, $Action, $DoorId, $DoorName, [string]$HttpStatus, $okText)
-    if ($Batch) { $parts += $Batch }
+    if ($Version -ge 4) {
+        # v4: EVERY field (the fault text too) in one JSON text of an ordered field list - no separator can be faked.
+        $o = [ordered]@{ v = 4; prev = $PrevHash; ts = $Ts; windowsUser = $WindowsUser; aeosUser = $AeosUser; action = $Action; doorId = $DoorId; doorName = $DoorName
+            httpStatus = [int]$HttpStatus; ok = [bool]$Ok; fault = [string]$Fault; batch = $Batch; computer = $Computer; doorAlias = $DoorAlias; clientIp = $ClientIp }
+        $s4 = ConvertTo-Json -InputObject $o -Compress
+        $sha4 = [System.Security.Cryptography.SHA256]::Create()
+        try { $b4 = $sha4.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($s4)) } finally { $sha4.Dispose() }
+        return (($b4 | ForEach-Object { $_.ToString('x2') }) -join '')
+    }
+    if ($Version -ge 3) { $parts += @('v3', $Batch, $Computer, $DoorAlias, $ClientIp) }
+    elseif ($Version -ge 2) { $parts += @('v2', $Batch, $Computer, $DoorAlias) }
+    elseif ($Batch) { $parts += $Batch }
     $s = $parts -join '|'
     $sha = [System.Security.Cryptography.SHA256]::Create()
     try { $bytes = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($s)) }
@@ -446,9 +481,14 @@ function Test-AuditChain {
         if ($null -eq $r -or $r.PSObject.Properties['parseError']) {
             return [pscustomobject]@{ ChainOk = $false; BadIndex = $i; Count = @($Records).Count }
         }
+        $ver = 1
+        if ($r.PSObject.Properties['v'] -and [int]$r.v -ge 4) { $ver = 4 }
+        elseif ($r.PSObject.Properties['v'] -and [int]$r.v -ge 3) { $ver = 3 }
+        elseif ($r.PSObject.Properties['v'] -and [int]$r.v -ge 2) { $ver = 2 }
         $h = Get-AuditHash -PrevHash $prev -Ts ([string]$r.ts) -WindowsUser ([string]$r.windowsUser) -AeosUser ([string]$r.aeosUser) `
             -Action ([string]$r.action) -DoorId ([string]$r.doorId) -DoorName ([string]$r.doorName) `
-            -HttpStatus ([int]$r.httpStatus) -Ok ([bool]$r.ok) -Batch ([string]$r.batch)
+            -HttpStatus ([int]$r.httpStatus) -Ok ([bool]$r.ok) -Batch ([string]$r.batch) `
+            -Version $ver -Computer ([string]$r.computer) -DoorAlias ([string]$r.doorAlias) -ClientIp ([string]$r.clientIp) -Fault ([string]$r.fault)
         if ([string]$r.prevHash -ne $prev -or [string]$r.hash -ne $h) {
             return [pscustomobject]@{ ChainOk = $false; BadIndex = $i; Count = @($Records).Count }
         }
@@ -565,11 +605,15 @@ function Get-DefaultConfigJson {
   "doorState": {
     "checks": [],
     "otherwiseLabel": "",
-    "maxDoorsPerRefresh": 500
+    "maxDoorsPerRefresh": 500,
+    "pollSeconds": 30,
+    "freshSeconds": 120
   },
   "locations": { "levels": [], "rules": [], "map": {}, "labels": {} },
   "groups": [],
-  "arming": { "armAction": "lock", "disarmAction": "normal", "armLabel": "Arm", "disarmLabel": "Disarm" }
+  "arming": { "armAction": "lock", "disarmAction": "normal", "armLabel": "Arm", "disarmLabel": "Disarm" },
+  "access": { "admins": [], "idleMinutes": 15 },
+  "aliases": {}
 }
 '@
 }
@@ -669,6 +713,10 @@ function Test-ConfigObject {
     else {
         $md = 0
         if (-not [int]::TryParse([string]$ds.maxDoorsPerRefresh, [ref]$md) -or $md -lt 1 -or $md -gt 5000) { $errs.Add('doorState.maxDoorsPerRefresh must be a number from 1 to 5000.') }
+        $pw = 0
+        if (-not [int]::TryParse([string]$ds.pollSeconds, [ref]$pw) -or $pw -lt 1 -or $pw -gt 3600) { $errs.Add('doorState.pollSeconds must be a number from 1 to 3600.') }
+        $fw = 0
+        if (-not [int]::TryParse([string]$ds.freshSeconds, [ref]$fw) -or $fw -lt 5 -or $fw -gt 86400) { $errs.Add('doorState.freshSeconds must be a number from 5 to 86400.') }
         $used = 0
         $ci = 0
         foreach ($c in @($ds.checks)) {
@@ -739,6 +787,28 @@ function Test-ConfigObject {
         else { $gseen[$gn.ToLowerInvariant()] = $true }
         if ($null -ne $g.match -and $g.match -isnot [System.Management.Automation.PSCustomObject]) { $errs.Add('groups[' + $gi + '].match must be an object of level -> list of values.') }
     }
+    $ac = $Config.access
+    if ($null -ne $ac) {
+        $im = 0
+        if (-not [int]::TryParse([string]$ac.idleMinutes, [ref]$im) -or $im -lt 1 -or $im -gt 720) { $errs.Add('access.idleMinutes must be a number from 1 to 720.') }
+        $seenAd = @{}
+        foreach ($an in @($ac.admins)) {
+            $n = ([string]$an).Trim()
+            if (-not $n) { $errs.Add('access.admins must not hold an empty name.'); continue }
+            if ($n.Length -gt 200 -or $n -match '[\x00-\x1F\x7F]') { $errs.Add('access.admins: a name is too long or has a control character.'); continue }
+            if ($seenAd.ContainsKey($n.ToLowerInvariant())) { $errs.Add('access.admins: the name "' + $n + '" is listed twice.'); continue }
+            $seenAd[$n.ToLowerInvariant()] = $true
+        }
+    }
+    if ($null -ne $Config.aliases) {
+        if ($Config.aliases -isnot [System.Management.Automation.PSCustomObject]) { $errs.Add('aliases must be an object of door id -> friendly name.') }
+        else {
+            foreach ($ap in $Config.aliases.PSObject.Properties) {
+                $ae = Test-AliasEntry -Id $ap.Name -Alias $ap.Value
+                if ($ae) { $errs.Add($ae) }
+            }
+        }
+    }
     $ar = $Config.arming
     if ($null -ne $ar) {
         foreach ($k in @('armAction', 'disarmAction')) {
@@ -749,6 +819,1053 @@ function Test-ConfigObject {
         }
     }
     return $errs.ToArray()
+}
+
+# ============================================================================
+# Operators and admins, aliases, per-user settings, audit filter, last-known states (pure helpers first)
+# ============================================================================
+
+function Test-AliasEntry {
+    # One door id -> friendly name pair. Returns a problem text, or $null when it is fine.
+    param($Id, $Alias)
+    $k = [string]$Id
+    if (-not $k -or $k.Length -gt 200 -or $k -match '[\x00-\x1F\x7F]') { return 'aliases: a door id is empty, longer than 200 characters or has a control character.' }
+    if ($Alias -isnot [string]) { return ('aliases["' + $k + '"] must be text.') }
+    if (-not $Alias.Trim()) { return ('aliases["' + $k + '"] must not be empty (remove the entry instead).') }
+    if ($Alias.Length -gt 200) { return ('aliases["' + $k + '"] is longer than 200 characters.') }
+    if ($Alias -match '[\x00-\x1F\x7F]') { return ('aliases["' + $k + '"] has a control character.') }
+    return $null
+}
+
+function Get-DoorAlias {
+    param([string]$Id)
+    if (-not $Id -or $null -eq $script:Config) { return '' }
+    $al = $script:Config.PSObject.Properties['aliases']
+    if (-not $al -or $null -eq $al.Value) { return '' }
+    $p = $al.Value.PSObject.Properties[$Id]
+    if ($p) { return [string]$p.Value }
+    return ''
+}
+
+function Get-AeosTargetChanges {
+    # The reasons (field names) why a new config points the server account somewhere else or makes its transport weaker:
+    # aeosUrl, socket.host, socket.port, socket.tls (true -> false), tlsSkipValidation and socket.tlsSkipValidation (false -> true).
+    param($Old, $New)
+    $why = @()
+    if ($null -eq $Old -or $null -eq $New) { return @($why) }
+    if ([string]$Old.aeosUrl -ne [string]$New.aeosUrl) { $why += 'aeosUrl' }
+    if ($null -ne $Old.socket -and $null -ne $New.socket) {
+        if ([string]$Old.socket.host -ne [string]$New.socket.host) { $why += 'socket.host' }
+        if ([string]$Old.socket.port -ne [string]$New.socket.port) { $why += 'socket.port' }
+        if ($Old.socket.tls -ne $false -and $New.socket.tls -eq $false) { $why += 'socket.tls' }
+        if ($Old.socket.tlsSkipValidation -ne $true -and $New.socket.tlsSkipValidation -eq $true) { $why += 'socket.tlsSkipValidation' }
+    }
+    if ($Old.tlsSkipValidation -ne $true -and $New.tlsSkipValidation -eq $true) { $why += 'tlsSkipValidation' }
+    return @($why)
+}
+
+function Get-AdminList {
+    # The admin names of the config, trimmed, without empty entries.
+    $list = @()
+    if ($null -ne $script:Config -and $null -ne $script:Config.PSObject.Properties['access'] -and $null -ne $script:Config.access) {
+        foreach ($a in @($script:Config.access.admins)) { if ($null -ne $a -and ([string]$a).Trim()) { $list += ([string]$a).Trim() } }
+    }
+    return @($list)
+}
+
+function Get-UserRole {
+    # admin = the name is in the admin list (case-insensitive). Everybody else, and a visitor who is not logged in when
+    # admins are set, is an operator. An EMPTY list is the first run: without -BehindProxy every user is an admin (even
+    # one who is not logged in); with -BehindProxy nobody is (the first admin is set in the config file on the server).
+    param([string[]]$Admins, [string]$User, [switch]$BehindProxy)
+    $list = @($Admins | Where-Object { $null -ne $_ -and ([string]$_).Trim() })
+    if ($list.Count -eq 0) { if ($BehindProxy) { return 'operator' } else { return 'admin' } }
+    $u = ([string]$User).Trim()
+    if ($u) { foreach ($a in $list) { if ([string]::Equals(([string]$a).Trim(), $u, [System.StringComparison]::OrdinalIgnoreCase)) { return 'admin' } } }
+    return 'operator'
+}
+
+function Get-CurrentUserName {
+    if ($null -ne $script:Cred) { return [string]$script:Cred.UserName }
+    return ''
+}
+
+function Get-SessionInfo {
+    $u = Get-CurrentUserName
+    $admins = @(Get-AdminList)
+    $role = Get-UserRole -Admins $admins -User $u -BehindProxy:([bool]$script:BehindProxy)
+    $info = @{ loggedIn = ($null -ne $script:Cred); user = $u; role = $role; noAdmins = ($admins.Count -eq 0); behindProxy = [bool]$script:BehindProxy; csrf = '' }
+    if ($null -ne $script:Sess) { $info.csrf = [string]$script:Sess.Csrf }
+    elseif (-not $script:BehindProxy) { $info.csrf = [string]$script:Token }
+    return $info
+}
+
+function Assert-Admin {
+    $u = Get-CurrentUserName
+    if ((Get-UserRole -Admins @(Get-AdminList) -User $u -BehindProxy:([bool]$script:BehindProxy)) -ne 'admin') {
+        throw (New-ApiException 403 'forbidden_role' 'Only an admin can do this. Ask an admin of this console (Setup tab, Admins).')
+    }
+}
+
+function Test-AdminOnlyRoute {
+    # Routes an operator must not use. Door list, state, actions, batch, arming, license read, session and own settings stay open.
+    param([string]$Method, [string]$Path)
+    $k = $Method.ToUpperInvariant() + ' ' + $Path
+    # Ignore letter case like the route match does (-eq / switch): 'PUT /api/v1/Aliases' must not skip the check.
+    if ($k.StartsWith('PUT /api/v1/aliases', [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
+    # The server account: every method (read, set, remove) is admin only.
+    if ($Path.Equals('/api/v1/server-account', [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
+    $admin = @('PUT /api/v1/config', 'GET /api/v1/wsdl', 'PUT /api/v1/license', 'POST /api/v1/call', 'POST /api/v1/socket',
+        'GET /api/v1/audit', 'GET /api/v1/audit/export', 'GET /api/v1/debuglog', 'GET /api/v1/debuglog/download',
+        'POST /api/v1/diagnostics', 'GET /api/v1/diagnostics/download')
+    return ($admin -contains $k)
+}
+function Test-AdminListChange {
+    # The admin who saves must stay an admin: the list cannot be emptied (that would make every user an admin) and
+    # must keep his own name. While the list is empty the first save needs a logged-in user who puts his own name in.
+    param([string[]]$Old, [string[]]$New, [string]$User)
+    $o = @($Old | Where-Object { $null -ne $_ -and ([string]$_).Trim() })
+    $n = @($New | Where-Object { $null -ne $_ -and ([string]$_).Trim() })
+    if ($n.Count -eq 0) {
+        if ($o.Count -gt 0) { return 'The admin list cannot be emptied: every user would become an admin. Keep your own name in it.' }
+        return $null
+    }
+    $u = ([string]$User).Trim()
+    if (-not $u) { return 'Log in first: the admin list must hold your own AEOS user name, otherwise you could not change settings any more.' }
+    foreach ($a in $n) { if ([string]::Equals(([string]$a).Trim(), $u, [System.StringComparison]::OrdinalIgnoreCase)) { return $null } }
+    return ('The admin list must keep your own name (' + $u + '). Another admin can remove it.')
+}
+
+function ConvertTo-UserSettings {
+    # Per-user page settings: rows per page, sort column + direction, last filter text, selected tree node.
+    # Missing fields get defaults; a wrong type or a too long text is refused. Returns @{ ok; error; value }.
+    param($In)
+    $res = @{ ok = $false; error = ''; value = $null }
+    if ($null -eq $In -or $In -isnot [System.Management.Automation.PSCustomObject]) { $res.error = 'The settings must be a JSON object.'; return $res }
+    $rows = 100
+    $sortCol = ''
+    $sortDir = ''
+    $filter = ''
+    $node = ''
+    $p = $In.PSObject.Properties['rows']
+    if ($p -and $null -ne $p.Value) {
+        $v = 0
+        if (-not [int]::TryParse([string]$p.Value, [ref]$v) -or @(0, 25, 50, 100, 250, 500) -notcontains $v) { $res.error = 'rows must be 25, 50, 100, 250, 500 or 0 (all).'; return $res }
+        $rows = $v
+    }
+    $caps = @{ sortCol = 100; filter = 200; node = 400 }
+    foreach ($k in @('sortCol', 'sortDir', 'filter', 'node')) {
+        $q = $In.PSObject.Properties[$k]
+        if (-not $q -or $null -eq $q.Value) { continue }
+        if ($q.Value -isnot [string]) { $res.error = $k + ' must be text.'; return $res }
+        $t = [string]$q.Value
+        if ($t -match '[\x00-\x1F\x7F]') { $res.error = $k + ' has a control character.'; return $res }
+        if ($caps.ContainsKey($k) -and $t.Length -gt $caps[$k]) { $res.error = $k + ' is longer than ' + $caps[$k] + ' characters.'; return $res }
+        if ($k -eq 'sortCol') { $sortCol = $t }
+        elseif ($k -eq 'sortDir') {
+            if (@('', 'asc', 'desc') -notcontains $t) { $res.error = 'sortDir must be asc or desc.'; return $res }
+            $sortDir = $t
+        }
+        elseif ($k -eq 'filter') { $filter = $t }
+        else { $node = $t }
+    }
+    if (-not $sortCol) { $sortDir = '' }
+    $res.ok = $true
+    $res.value = [ordered]@{ rows = $rows; sortCol = $sortCol; sortDir = $sortDir; filter = $filter; node = $node }
+    return $res
+}
+
+function Read-UserSettingsFile {
+    # doorkeeper-users.json: { "users": { "<aeos user, lowercase>": { settings } } }. A missing or broken file = no settings.
+    $map = [ordered]@{}
+    if ($script:UsersPath -and (Test-Path -LiteralPath $script:UsersPath)) {
+        try {
+            $o = ConvertFrom-Json -InputObject ([System.IO.File]::ReadAllText($script:UsersPath))
+            if ($null -ne $o -and $null -ne $o.PSObject.Properties['users'] -and $null -ne $o.users) {
+                foreach ($p in $o.users.PSObject.Properties) { $map[$p.Name] = $p.Value }
+            }
+        }
+        catch { Write-DebugLog 'startup' ('User settings file not read: ' + $_.Exception.Message) 'WARN' }
+    }
+    $script:UserSettings = $map
+}
+
+function Save-UserSettingsFile {
+    $text = ConvertTo-Json -InputObject ([ordered]@{ users = $script:UserSettings }) -Depth 5
+    $dir = Split-Path -Parent $script:UsersPath
+    if ($dir -and -not (Test-Path -LiteralPath $dir)) { [void](New-Item -ItemType Directory -Path $dir -Force) }
+    $tmp = $script:UsersPath + '.tmp'
+    [System.IO.File]::WriteAllText($tmp, $text, (New-Object System.Text.UTF8Encoding($false)))
+    if (Test-Path -LiteralPath $script:UsersPath) { [System.IO.File]::Replace($tmp, $script:UsersPath, [NullString]::Value) }
+    else { [System.IO.File]::Move($tmp, $script:UsersPath) }
+}
+
+function Get-UserSettings {
+    param([string]$User)
+    $k = ([string]$User).Trim().ToLowerInvariant()
+    if ($k -and $script:UserSettings -and $script:UserSettings.Contains($k)) { return $script:UserSettings[$k] }
+    return $null
+}
+
+function Set-UserSettings {
+    param([string]$User, $Value)
+    $k = ([string]$User).Trim().ToLowerInvariant()
+    if (-not $k) { throw (New-ApiException 401 'not_logged_in' 'Log in with the AEOS user first.') }
+    if ($null -eq $script:UserSettings) { $script:UserSettings = [ordered]@{} }
+    $script:UserSettings[$k] = $Value
+    Save-UserSettingsFile
+}
+
+function Select-AuditRecords {
+    # Filters for the Audit tab and its CSV export. User matches the AEOS or Windows user, Door matches id, name or alias
+    # (all case-insensitive "contains"). Action: empty / all, opened (= unlock or access) or one action name.
+    # From / To are UTC dates yyyy-MM-dd, both inclusive. A record that could not be read is never matched by a filter.
+    param($Records, [string]$User = '', [string]$Door = '', [string]$Action = '', [string]$From = '', [string]$To = '')
+    $out = @()
+    $ci = [System.StringComparison]::OrdinalIgnoreCase
+    foreach ($r in @($Records)) {
+        if ($null -eq $r) { continue }
+        $bad = [bool]$r.PSObject.Properties['parseError']
+        if ($bad) { if (-not ($User -or $Door -or $Action -or $From -or $To)) { $out += $r }; continue }
+        if ($User) {
+            if (([string]$r.aeosUser).IndexOf($User, $ci) -lt 0 -and ([string]$r.windowsUser).IndexOf($User, $ci) -lt 0) { continue }
+        }
+        if ($Door) {
+            if (([string]$r.doorId).IndexOf($Door, $ci) -lt 0 -and ([string]$r.doorName).IndexOf($Door, $ci) -lt 0 -and ([string]$r.doorAlias).IndexOf($Door, $ci) -lt 0) { continue }
+        }
+        if ($Action -and $Action -ne 'all') {
+            $a = [string]$r.action
+            if ($Action -eq 'opened') { if ($a -ne 'unlock' -and $a -ne 'access') { continue } }
+            elseif (-not [string]::Equals($a, $Action, $ci)) { continue }
+        }
+        $day = ([string]$r.ts)
+        if ($day.Length -ge 10) { $day = $day.Substring(0, 10) }
+        if ($From -match '^\d{4}-\d\d-\d\d$' -and [string]::CompareOrdinal($day, $From) -lt 0) { continue }
+        if ($To -match '^\d{4}-\d\d-\d\d$' -and [string]::CompareOrdinal($day, $To) -gt 0) { continue }
+        $out += $r
+    }
+    return @($out)
+}
+
+function ConvertTo-AuditCsv {
+    param($Records)
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.Append("time_utc,computer,client_ip,windows_user,aeos_user,action,door_id,door_name,door_alias,http_status,ok,fault,batch`r`n")
+    foreach ($r in @($Records)) {
+        if ($null -eq $r -or $r.PSObject.Properties['parseError']) { continue }
+        $okText = 'false'
+        if ($r.ok) { $okText = 'true' }
+        $cells = @([string]$r.ts, [string]$r.computer, [string]$r.clientIp, [string]$r.windowsUser, [string]$r.aeosUser, [string]$r.action, [string]$r.doorId,
+            [string]$r.doorName, [string]$r.doorAlias, [string]$r.httpStatus, $okText, [string]$r.fault, [string]$r.batch)
+        [void]$sb.Append((($cells | ForEach-Object { ConvertTo-CsvCell $_ }) -join ',') + "`r`n")
+    }
+    return $sb.ToString()
+}
+
+function Update-StateCache {
+    # Remembers the last state read of each door (memory now, doorkeeper-state-cache.json soon). A failed read ("?") is
+    # not remembered. The cache only paints the page; it never enables an action.
+    # Every write gets the next version number (the page asks for the entries newer than its last version). The cache and
+    # the version counter are synchronized objects: the poller runspace writes to them too.
+    # -ObservedAt = when the state was read (default now). An observation older than the cached one of that door is ignored, so
+    # a slow poll round that ends after a door action cannot put the earlier state back.
+    param($States, $ObservedAt = $null)
+    if ($null -eq $script:StateCache) { $script:StateCache = [hashtable]::Synchronized(@{}) }
+    if ($null -eq $script:StateMeta) { $script:StateMeta = [hashtable]::Synchronized(@{ Ver = 1; Dirty = $false }) }
+    if ($null -eq $ObservedAt) { $ObservedAt = [DateTime]::UtcNow }
+    $now = ([DateTime]$ObservedAt).ToString('yyyy-MM-ddTHH:mm:ssZ')
+    $ticks = ([DateTime]$ObservedAt).Ticks
+    foreach ($s in @($States)) {
+        if ($null -eq $s) { continue }
+        $id = [string]$s.id
+        $st = [string]$s.state
+        if (-not $id -or -not $st -or $st -eq '?') { continue }
+        $d = [string]$s.detail
+        if ($d.Length -gt 200) { $d = $d.Substring(0, 200) }
+        # version number and entry are stored under the same lock the since-answer is built under
+        [System.Threading.Monitor]::Enter($script:StateCache.SyncRoot)
+        try {
+            $cur = $script:StateCache[$id]
+            if ($null -ne $cur -and $cur.ContainsKey('t') -and [long]$cur.t -gt $ticks) { continue }
+            $script:StateMeta.Ver = [int]$script:StateMeta.Ver + 1
+            $ver = [int]$script:StateMeta.Ver
+            $script:StateMeta.Dirty = $true
+            $script:StateCache[$id] = @{ state = $st; detail = $d; at = $now; v = $ver; t = $ticks }
+        }
+        finally { [System.Threading.Monitor]::Exit($script:StateCache.SyncRoot) }
+        $script:StateCacheDirty = $true
+    }
+}
+
+function Get-LastKnownStates {
+    # id -> @{ state; detail; at } for the listed doors that have a remembered state.
+    param($Doors)
+    $out = @{}
+    if ($null -eq $script:StateCache) { return $out }
+    foreach ($d in @($Doors)) {
+        if ($null -eq $d) { continue }
+        $id = [string]$d.id
+        if ($id -and $script:StateCache.ContainsKey($id)) { $out[$id] = $script:StateCache[$id] }
+    }
+    return $out
+}
+
+function Save-StateCache {
+    param([int]$MinAgeSec = 5)
+    $metaDirty = ($null -ne $script:StateMeta -and $script:StateMeta.Dirty -eq $true)
+    if ((-not $script:StateCacheDirty -and -not $metaDirty) -or -not $script:StateCachePath) { return }
+    if ($null -ne $script:StateCacheSaved -and ([DateTime]::UtcNow - $script:StateCacheSaved).TotalSeconds -lt $MinAgeSec) { return }
+    try {
+        $snap = @{}
+        [System.Threading.Monitor]::Enter($script:StateCache.SyncRoot)
+        try { foreach ($k in @($script:StateCache.Keys)) { $e = $script:StateCache[$k]; $snap[$k] = @{ state = $e.state; detail = $e.detail; at = $e.at } } }
+        finally { [System.Threading.Monitor]::Exit($script:StateCache.SyncRoot) }
+        $text = ConvertTo-Json -InputObject @{ states = $snap } -Depth 5 -Compress
+        $tmp = $script:StateCachePath + '.tmp'
+        [System.IO.File]::WriteAllText($tmp, $text, (New-Object System.Text.UTF8Encoding($false)))
+        if (Test-Path -LiteralPath $script:StateCachePath) { [System.IO.File]::Replace($tmp, $script:StateCachePath, [NullString]::Value) }
+        else { [System.IO.File]::Move($tmp, $script:StateCachePath) }
+        $script:StateCacheDirty = $false
+        if ($null -ne $script:StateMeta) { $script:StateMeta.Dirty = $false }
+        $script:StateCacheSaved = [DateTime]::UtcNow
+    }
+    catch { Write-DebugLog 'state-cache' ('State cache not saved: ' + $_.Exception.Message) 'WARN' }
+}
+
+function Read-StateCacheFile {
+    $script:StateCache = [hashtable]::Synchronized(@{})
+    $script:StateMeta = [hashtable]::Synchronized(@{ Ver = 1; Dirty = $false })
+    $script:StateCacheDirty = $false
+    if ($script:StateCachePath -and (Test-Path -LiteralPath $script:StateCachePath)) {
+        try {
+            $o = ConvertFrom-Json -InputObject ([System.IO.File]::ReadAllText($script:StateCachePath))
+            if ($null -ne $o -and $null -ne $o.PSObject.Properties['states'] -and $null -ne $o.states) {
+                foreach ($p in $o.states.PSObject.Properties) {
+                    $v = $p.Value
+                    if ($null -ne $v -and [string]$v.state) { $script:StateCache[$p.Name] = @{ state = [string]$v.state; detail = [string]$v.detail; at = [string]$v.at; v = 1 } }
+                }
+            }
+        }
+        catch { Write-DebugLog 'startup' ('State cache file not read: ' + $_.Exception.Message) 'WARN' }
+    }
+}
+
+# ============================================================================
+# Hosting behind a reverse proxy (IIS): sessions, origin and forwarded-address checks, login rate limit, single instance,
+# server account store (DPAPI), background jobs and the state poller (pure helpers first; unit tested)
+# ============================================================================
+
+function New-RandomHex {
+    param([int]$Bytes = 32)
+    $b = New-Object byte[] $Bytes
+    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    try { $rng.GetBytes($b) } finally { $rng.Dispose() }
+    return (($b | ForEach-Object { $_.ToString('x2') }) -join '')
+}
+
+function Get-PublicOrigin {
+    # scheme://host[:port] of -PublicUrl, lower case, default port dropped, no path. $null when it is not usable: only
+    # https:// is accepted, plus http:// for localhost / 127.0.0.1 (tests and a first check on the server itself).
+    param([string]$Url)
+    if (-not $Url) { return $null }
+    $u = $null
+    if (-not [System.Uri]::TryCreate($Url.Trim(), [System.UriKind]::Absolute, [ref]$u)) { return $null }
+    if ($u.Scheme -eq 'https') { return $u.GetLeftPart([System.UriPartial]::Authority) }
+    if ($u.Scheme -eq 'http' -and ($u.Host -eq 'localhost' -or $u.Host -eq '127.0.0.1')) { return $u.GetLeftPart([System.UriPartial]::Authority) }
+    return $null
+}
+
+function Test-OriginAllowed {
+    # No Origin header = allowed (the page key still has to match); otherwise it must equal the allowed origin exactly.
+    param([string]$Origin, [string]$Allowed)
+    if (-not $Origin) { return $true }
+    return ($Origin.TrimEnd('/') -ceq $Allowed.TrimEnd('/'))
+}
+
+function Test-CsrfToken {
+    # Case-sensitive, constant-time compare of the page key (X-Console-Token) with the key of the session.
+    param([string]$Expected, [string]$Supplied)
+    if (-not $Expected -or $null -eq $Supplied -or $Expected.Length -ne $Supplied.Length) { return $false }
+    $d = 0
+    for ($i = 0; $i -lt $Expected.Length; $i++) { $d = $d -bor ([int][char]$Expected[$i] -bxor [int][char]$Supplied[$i]) }
+    return ($d -eq 0)
+}
+
+function Test-LocalProxyPeer {
+    param([string]$RemoteAddr)
+    return (@('127.0.0.1', '::1', '::ffff:127.0.0.1') -contains ([string]$RemoteAddr).Trim())
+}
+
+function Get-ForwardedClientIp {
+    # The client address for the audit. Behind IIS EVERY request comes from 127.0.0.1, so "trust 127.0.0.1" alone would let a
+    # browser forge the value. The sample web.config therefore has a URL Rewrite rule that OVERWRITES X-DK-Client-IP with
+    # {REMOTE_ADDR} on every request; that single value is what is read here. Only with -BehindProxy and only on a request from
+    # 127.0.0.1. Never X-Forwarded-For or any other client-sent header. An empty or invalid value (or a list) = the peer address.
+    param([string]$RemoteAddr, [string]$ForwardedFor, [bool]$BehindProxy)
+    if (-not $BehindProxy -or -not (Test-LocalProxyPeer -RemoteAddr $RemoteAddr)) { return [string]$RemoteAddr }
+    $v = ([string]$ForwardedFor).Trim()
+    if ($v -match '^(\d{1,3}(?:\.\d{1,3}){3}):\d+$') { $v = $Matches[1] }
+    $ip = $null
+    if ($v -and $v.IndexOf(',') -lt 0 -and [System.Net.IPAddress]::TryParse($v, [ref]$ip)) { return $ip.ToString() }
+    return [string]$RemoteAddr
+}
+function Get-CookieValue {
+    param([string]$Header, [string]$Name)
+    foreach ($part in ([string]$Header -split ';')) {
+        $kv = $part.Trim()
+        $i = $kv.IndexOf('=')
+        if ($i -gt 0 -and $kv.Substring(0, $i) -ceq $Name) { return $kv.Substring($i + 1) }
+    }
+    return ''
+}
+
+function New-SessionCookieHeader {
+    # HttpOnly, SameSite=Strict, Path=/ ; Secure with -BehindProxy. -Clear ends the cookie in the browser.
+    param([string]$Id, [bool]$Secure, [bool]$Clear = $false)
+    if ($Clear) { $c = 'dk_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT' }
+    else { $c = 'dk_session=' + $Id + '; Path=/; HttpOnly; SameSite=Strict' }
+    if ($Secure) { $c += '; Secure' }
+    return $c
+}
+
+function New-SessionRecord {
+    # A session: random 32-byte id (the cookie), its own page key (X-Console-Token), the AEOS user and credential (memory
+    # only), client address, Windows user (IIS), created and last-seen time.
+    param($Cred, [string]$ClientIp = '', [string]$WindowsUser = '', $Now = $null)
+    if ($null -eq $Now) { $Now = [DateTime]::UtcNow }
+    return @{ Id = (New-RandomHex 32); Csrf = (New-RandomHex 32); User = [string]$Cred.UserName; Cred = $Cred; ClientIp = $ClientIp; WindowsUser = $WindowsUser; Created = $Now; LastSeen = $Now; DoorIds = @{} }
+}
+
+function Test-SessionExpired {
+    # '' = still valid; 'idle' = no request for IdleMinutes; 'absolute' = older than AbsoluteHours (12 h).
+    param($Session, $Now, [int]$IdleMinutes = 15, [int]$AbsoluteHours = 12)
+    if (($Now - $Session.LastSeen).TotalMinutes -ge $IdleMinutes) { return 'idle' }
+    if (($Now - $Session.Created).TotalHours -ge $AbsoluteHours) { return 'absolute' }
+    return ''
+}
+
+function Get-IdleMinutes {
+    $n = 15
+    if ($null -ne $script:Config -and $null -ne $script:Config.PSObject.Properties['access'] -and $null -ne $script:Config.access) {
+        [void][int]::TryParse([string]$script:Config.access.idleMinutes, [ref]$n)
+    }
+    if ($n -lt 1) { $n = 15 }
+    return $n
+}
+
+function Find-Session {
+    # Looks the cookie value up; an expired session is removed. Returns @{ Session; Expired } (Expired = idle | absolute).
+    param([string]$Id, [switch]$NoTouch)
+    $res = @{ Session = $null; Expired = '' }
+    if ($null -eq $script:Sessions -or -not $Id -or $Id -notmatch '^[0-9a-f]{64}$') { return $res }
+    if (-not $script:Sessions.ContainsKey($Id)) {
+        # the sweeper may have removed an expired session already: it left a note with the reason
+        if ($null -ne $script:ExpiredNotes -and $script:ExpiredNotes.ContainsKey($Id)) { $res.Expired = [string]$script:ExpiredNotes[$Id] }
+        return $res
+    }
+    $s = $script:Sessions[$Id]
+    $now = [DateTime]::UtcNow
+    $why = Test-SessionExpired -Session $s -Now $now -IdleMinutes (Get-IdleMinutes)
+    if ($why) { $script:Sessions.Remove($Id); $res.Expired = $why; return $res }
+    if (-not $NoTouch) { $s.LastSeen = $now }
+    $res.Session = $s
+    return $res
+}
+
+function Remove-ExpiredSessions {
+    if ($null -eq $script:Sessions) { return }
+    $now = [DateTime]::UtcNow
+    $idle = Get-IdleMinutes
+    foreach ($k in @($script:Sessions.Keys)) {
+        $why = Test-SessionExpired -Session $script:Sessions[$k] -Now $now -IdleMinutes $idle
+        if ($why) {
+            $script:Sessions.Remove($k)
+            if ($null -eq $script:ExpiredNotes) { $script:ExpiredNotes = @{} }
+            if ($script:ExpiredNotes.Count -gt 500) { $script:ExpiredNotes.Clear() }
+            $script:ExpiredNotes[$k] = $why
+        }
+    }
+}
+
+# ---- login rate limit: 5 failures in 5 minutes block that user + client address pair for 5 minutes ----------------
+
+function New-LoginAttemptEntry { return @{ Fails = (New-Object System.Collections.Generic.List[DateTime]); BlockedUntil = [DateTime]::MinValue } }
+
+function Get-LoginBlockSeconds {
+    param($Entry, $Now)
+    if ($null -eq $Entry -or $Entry.BlockedUntil -le $Now) { return 0 }
+    return [int][Math]::Ceiling(($Entry.BlockedUntil - $Now).TotalSeconds)
+}
+
+function Register-LoginFailure {
+    # Records a failure; returns $true when this failure starts a block.
+    param($Entry, $Now, [int]$Max = 5, [int]$WindowSec = 300, [int]$BlockSec = 300)
+    $keep = New-Object System.Collections.Generic.List[DateTime]
+    foreach ($t in $Entry.Fails) { if (($Now - $t).TotalSeconds -lt $WindowSec) { $keep.Add($t) } }
+    $keep.Add($Now)
+    $Entry.Fails = $keep
+    if ($keep.Count -ge $Max) { $Entry.BlockedUntil = $Now.AddSeconds($BlockSec); $Entry.Fails = (New-Object System.Collections.Generic.List[DateTime]); return $true }
+    return $false
+}
+
+function Get-LoginKey {
+    param([string]$User, [string]$ClientIp)
+    return (([string]$User).Trim().ToLowerInvariant() + '|' + [string]$ClientIp)
+}
+
+# ---- job bookkeeping (batch actions run as background jobs; the request loop only answers short requests) ---------
+
+function New-JobRecord {
+    # A synchronized hashtable: the worker runspace and the request thread both read and write it.
+    param([string]$Id, [string]$User, [string]$Action, [int]$Total, $Now = $null)
+    if ($null -eq $Now) { $Now = [DateTime]::UtcNow }
+    return [hashtable]::Synchronized(@{
+        Id = $Id; User = $User; Action = $Action; State = 'queued'; Phase = 'Queued'; Done = 0; Total = $Total
+        StartedAt = $Now; FinishedAt = $null; Error = ''; ErrorCode = ''; ErrorStatus = 0; Result = $null; Cred = $null; Ps = $null; Rs = $null; Handle = $null
+    })
+}
+
+function Test-JobActive {
+    param($Job)
+    return ($null -ne $Job -and (@('queued', 'running') -contains [string]$Job.State))
+}
+
+function Find-ActiveJobOfUser {
+    # One job per operator at a time (user names compare without regard to letter case).
+    param($Jobs, [string]$User)
+    foreach ($j in @($Jobs.Values)) {
+        if ((Test-JobActive -Job $j) -and [string]::Equals([string]$j.User, $User, [System.StringComparison]::OrdinalIgnoreCase)) { return $j }
+    }
+    return $null
+}
+
+function Get-JobPublic {
+    # What the page may see of a job: no credential, no runspace objects.
+    param($Job)
+    $o = @{
+        id = [string]$Job.Id; state = [string]$Job.State; phase = [string]$Job.Phase; action = [string]$Job.Action; user = [string]$Job.User
+        done = [int]$Job.Done; total = [int]$Job.Total; startedAt = ([DateTime]$Job.StartedAt).ToString('yyyy-MM-ddTHH:mm:ssZ')
+    }
+    if ($null -ne $Job.FinishedAt) { $o.finishedAt = ([DateTime]$Job.FinishedAt).ToString('yyyy-MM-ddTHH:mm:ssZ') }
+    if ($Job.State -eq 'failed') { $o.error = @{ code = [string]$Job.ErrorCode; message = [string]$Job.Error } }
+    if ($Job.State -eq 'done') { $o.result = $Job.Result }
+    return $o
+}
+
+function Remove-OldJobs {
+    # Finished jobs stay available for KeepMinutes; returns the number removed.
+    param($Jobs, $Now, [int]$KeepMinutes = 60)
+    $n = 0
+    foreach ($k in @($Jobs.Keys)) {
+        $j = $Jobs[$k]
+        if ($null -ne $j.FinishedAt -and ($Now - [DateTime]$j.FinishedAt).TotalMinutes -ge $KeepMinutes) { $Jobs.Remove($k); $n++ }
+    }
+    return $n
+}
+
+# ---- single instance ---------------------------------------------------------------------------------------------
+
+function Open-InstanceLock {
+    # Takes an exclusive lock file; the returned stream must stay open for the life of the process. $null = another
+    # instance holds it. -WaitSeconds covers an IIS recycle, where the new process starts before the old one is gone.
+    param([string]$Path, [int]$WaitSeconds = 0)
+    $end = [DateTime]::UtcNow.AddSeconds($WaitSeconds)
+    while ($true) {
+        try {
+            $dir = Split-Path -Parent $Path
+            if ($dir -and -not (Test-Path -LiteralPath $dir)) { [void](New-Item -ItemType Directory -Path $dir -Force) }
+            $fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+            $b = (New-Object System.Text.UTF8Encoding($false)).GetBytes('pid ' + $PID + "`r`n")
+            $fs.SetLength(0)
+            $fs.Write($b, 0, $b.Length)
+            $fs.Flush()
+            return $fs
+        }
+        catch {
+            if ([DateTime]::UtcNow -ge $end) { return $null }
+            Start-Sleep -Milliseconds 250
+        }
+    }
+}
+
+# ---- server account (the AEOS user the console uses to read door states) ------------------------------------------
+
+function Get-ServerAccountEntropy { return [System.Text.Encoding]::UTF8.GetBytes('DoorKeeper.ServerAccount.v1') }
+
+function ConvertTo-ServerAccountBlob {
+    # DPAPI, CurrentUser scope (the Windows account that runs DoorKeeper, the IIS app pool identity), fixed entropy.
+    param($Cred, [byte[]]$Entropy = $null)
+    if ($null -eq $Entropy) { $Entropy = Get-ServerAccountEntropy }
+    Add-Type -AssemblyName System.Security
+    $json = ConvertTo-Json -InputObject ([ordered]@{ user = [string]$Cred.UserName; password = [string]$Cred.GetNetworkCredential().Password }) -Compress
+    $plain = (New-Object System.Text.UTF8Encoding($false)).GetBytes($json)
+    try { return [System.Security.Cryptography.ProtectedData]::Protect($plain, $Entropy, [System.Security.Cryptography.DataProtectionScope]::CurrentUser) }
+    finally { [Array]::Clear($plain, 0, $plain.Length) }
+}
+
+function ConvertFrom-ServerAccountBlob {
+    # Never throws: @{ ok; cred; error }. A blob made by another Windows account (or with other entropy) does not decrypt.
+    param([byte[]]$Blob, [byte[]]$Entropy = $null)
+    $res = @{ ok = $false; cred = $null; error = '' }
+    if ($null -eq $Entropy) { $Entropy = Get-ServerAccountEntropy }
+    $plain = $null
+    try {
+        Add-Type -AssemblyName System.Security
+        $plain = [System.Security.Cryptography.ProtectedData]::Unprotect($Blob, $Entropy, [System.Security.Cryptography.DataProtectionScope]::CurrentUser)
+        $o = ConvertFrom-Json -InputObject ((New-Object System.Text.UTF8Encoding($false)).GetString($plain))
+        $u = [string]$o.user
+        $pw = [string]$o.password
+        if (-not $u -or -not $pw) { throw 'The stored account is incomplete.' }
+        $ss = New-Object System.Security.SecureString
+        foreach ($ch in $pw.ToCharArray()) { $ss.AppendChar($ch) }
+        $ss.MakeReadOnly()
+        $res.cred = New-Object System.Management.Automation.PSCredential($u, $ss)
+        $res.ok = $true
+    }
+    catch { $res.error = 'The stored server account cannot be read (' + $_.Exception.GetType().Name + ').' }
+    finally { if ($null -ne $plain) { [Array]::Clear($plain, 0, $plain.Length) } }
+    return $res
+}
+
+function Set-ServerAccountAcl {
+    # Only the Windows account that runs DoorKeeper and the Administrators group; inheritance off. Returns '' or the reason.
+    param([string]$Path)
+    try {
+        $sec = New-Object System.Security.AccessControl.FileSecurity
+        $sec.SetAccessRuleProtection($true, $false)
+        $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+        $adm = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')
+        foreach ($sid in @($me, $adm)) {
+            $sec.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sid, [System.Security.AccessControl.FileSystemRights]::FullControl, [System.Security.AccessControl.AccessControlType]::Allow)))
+        }
+        (New-Object System.IO.FileInfo($Path)).SetAccessControl($sec)
+        return ''
+    }
+    catch { return $_.Exception.Message }
+}
+
+function Save-ServerAccount {
+    # Writes the DPAPI blob (ACL set before the file gets its final name) and a small meta file (who, when). The password
+    # is in the blob only. Returns @{ aclError }.
+    param($Cred, [string]$SetBy, [string]$BlobPath, [string]$MetaPath)
+    $blob = ConvertTo-ServerAccountBlob -Cred $Cred
+    $tmp = $BlobPath + '.tmp'
+    [System.IO.File]::WriteAllBytes($tmp, $blob)
+    $aclErr = Set-ServerAccountAcl -Path $tmp
+    if (Test-Path -LiteralPath $BlobPath) { [System.IO.File]::Replace($tmp, $BlobPath, [NullString]::Value) }
+    else { [System.IO.File]::Move($tmp, $BlobPath) }
+    $meta = ConvertTo-Json -InputObject ([ordered]@{ setBy = $SetBy; setAt = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ') }) -Compress
+    [System.IO.File]::WriteAllText($MetaPath, $meta, (New-Object System.Text.UTF8Encoding($false)))
+    return @{ aclError = $aclErr }
+}
+
+function Read-ServerAccount {
+    # @{ present; ok; cred; error; setBy; setAt }. present = the blob file exists; ok = it decrypted.
+    param([string]$BlobPath, [string]$MetaPath)
+    $res = @{ present = $false; ok = $false; cred = $null; error = ''; setBy = ''; setAt = '' }
+    if (-not $BlobPath -or -not (Test-Path -LiteralPath $BlobPath)) { return $res }
+    $res.present = $true
+    if ($MetaPath -and (Test-Path -LiteralPath $MetaPath)) {
+        try { $m = ConvertFrom-Json -InputObject ([System.IO.File]::ReadAllText($MetaPath)); $res.setBy = [string]$m.setBy; $res.setAt = [string]$m.setAt } catch { }
+    }
+    try { $blob = [System.IO.File]::ReadAllBytes($BlobPath) }
+    catch { $res.error = 'The server account file cannot be read: ' + $_.Exception.Message; return $res }
+    $d = ConvertFrom-ServerAccountBlob -Blob $blob
+    $res.ok = $d.ok
+    $res.cred = $d.cred
+    $res.error = $d.error
+    return $res
+}
+
+function Remove-ServerAccountFiles {
+    param([string]$BlobPath, [string]$MetaPath)
+    foreach ($p in @($BlobPath, $MetaPath)) { if ($p -and (Test-Path -LiteralPath $p)) { Remove-Item -LiteralPath $p -Force } }
+}
+
+function Get-ServerAccountStatus {
+    # What an admin sees: never the user name's password, never the blob. state: none | running | login-failed |
+    # starting | reenter (the stored account cannot be decrypted).
+    $st = @{ set = $false; state = 'none'; setBy = ''; setAt = ''; lastLoginOkAt = ''; lastError = ''; message = 'No server account is set.' }
+    $a = $script:ServerAccount
+    if ($null -eq $a -or -not $a.present) { return $st }
+    $st.set = $true
+    $st.setBy = [string]$a.setBy
+    $st.setAt = [string]$a.setAt
+    if (-not $a.ok) {
+        $st.state = 'reenter'
+        $st.message = 'Server account must be entered again.'
+        $st.lastError = [string]$a.error
+        return $st
+    }
+    $p = $null
+    if ($null -ne $script:Shared) { $p = $script:Shared.Poll }
+    if ($null -eq $p -or -not $p.LastRoundAt) { $st.state = 'starting'; $st.message = 'The server account is set. The first read of the door states is starting.'; return $st }
+    $st.lastLoginOkAt = [string]$p.LastLoginOkAt
+    $st.lastError = [string]$p.Error
+    if ($p.State -eq 'ok') { $st.state = 'running'; $st.message = 'The server account reads the door states.' }
+    else { $st.state = 'login-failed'; $st.message = 'The last read of the door states failed.' }
+    return $st
+}
+
+# ---- live states: the page asks for the changes since its last version --------------------------------------------
+
+function Get-StateChanges {
+    # id -> @{ state; detail; ageSec } for every cache entry newer than -Since (the version counter). The cache is
+    # copied under its lock because the poller writes to it from another runspace.
+    param([int]$Since, $Now = $null)
+    if ($null -eq $Now) { $Now = [DateTime]::UtcNow }
+    $out = @{}
+    if ($null -eq $script:StateCache) { return $out }
+    $lock = $script:StateCache.SyncRoot
+    [System.Threading.Monitor]::Enter($lock)
+    try {
+        foreach ($k in @($script:StateCache.Keys)) {
+            $e = $script:StateCache[$k]
+            $v = 0
+            if ($e.ContainsKey('v')) { $v = [int]$e.v }
+            if ($v -le $Since) { continue }
+            $age = 999999
+            $at = [DateTime]::MinValue
+            if ([DateTime]::TryParse([string]$e.at, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AdjustToUniversal -bor [System.Globalization.DateTimeStyles]::AssumeUniversal, [ref]$at)) {
+                $age = [int][Math]::Max(0, ($Now - $at).TotalSeconds)
+            }
+            $out[$k] = @{ state = [string]$e.state; detail = [string]$e.detail; ageSec = $age }
+        }
+    }
+    finally { [System.Threading.Monitor]::Exit($lock) }
+    return $out
+}
+
+# ---- the server's own door list: the routes take door ids and use name / extra from here, never from the client ----
+
+function Set-ServerDoors {
+    # Merges doors read by a listDoors call (by id) into the shared list. A new table is built and swapped in.
+    param($Doors)
+    if ($null -eq $script:Shared) { return }
+    [System.Threading.Monitor]::Enter($script:Shared)
+    try {
+        $m = @{}
+        $cur = $script:Shared.DoorMap
+        if ($null -ne $cur) { foreach ($k in $cur.Keys) { $m[$k] = $cur[$k] } }
+        foreach ($d in @($Doors)) {
+            if ($null -eq $d -or -not [string]$d.id) { continue }
+            $m[[string]$d.id] = [pscustomobject]@{ id = [string]$d.id; name = [string]$d.name; extra = $d.extra }
+        }
+        $script:Shared.DoorMap = $m
+    }
+    finally { [System.Threading.Monitor]::Exit($script:Shared) }
+}
+
+function Resolve-ServerDoors {
+    # Door ids (or door objects: only the id is used) -> the server's own door objects. An unknown id is a 400 unknown_door.
+    # -Allowed (the door ids this session listed itself) limits it further; $null = no limit (no session).
+    param($Requested, $Map, $Allowed = $null)
+    $out = @()
+    foreach ($r in @($Requested)) {
+        if ($null -eq $r) { continue }
+        $id = ''
+        if ($r -is [string]) { $id = $r } elseif ($null -ne $r.PSObject.Properties['id']) { $id = [string]$r.id }
+        if (-not $id -or $null -eq $Map -or -not $Map.ContainsKey($id) -or ($null -ne $Allowed -and -not $Allowed.ContainsKey($id))) {
+            throw (New-ApiException 400 'unknown_door' ('The door "' + $id + '" is not in the door list of the server. Load doors again. Nothing was sent.'))
+        }
+        $out += $Map[$id]
+    }
+    return @($out)
+}
+
+function Get-StateAnswer {
+    # The version and the changes since -Since from ONE locked read (a writer cannot slip between them), limited to the door
+    # ids -Allowed (the doors this session listed itself); no list = nothing.
+    param([int]$Since, $Allowed)
+    $lock = $null
+    if ($null -ne $script:StateCache) { $lock = $script:StateCache.SyncRoot }
+    if ($null -eq $lock) { return @{ ver = (Get-StateVersion); states = @{} } }
+    [System.Threading.Monitor]::Enter($lock)
+    try {
+        $ver = Get-StateVersion
+        $all = Get-StateChanges -Since $Since
+    }
+    finally { [System.Threading.Monitor]::Exit($lock) }
+    return @{ ver = $ver; states = (Select-StatesForIds -States $all -Ids $Allowed) }
+}
+
+function Select-StatesForIds {
+    param($States, $Ids)
+    $out = @{}
+    if ($null -eq $Ids) { return $out }
+    foreach ($k in @($States.Keys)) { if ($Ids.ContainsKey([string]$k)) { $out[$k] = $States[$k] } }
+    return $out
+}
+
+function Get-CachedStates {
+    # id -> @{ id; state; detail; ageSec } straight from the cache (live mode answers a state request from here).
+    param($Ids)
+    $now = [DateTime]::UtcNow
+    $out = @()
+    foreach ($id in @($Ids)) {
+        $e = $null
+        if ($null -ne $script:StateCache -and $script:StateCache.ContainsKey([string]$id)) { $e = $script:StateCache[[string]$id] }
+        if ($null -eq $e) { $out += @{ id = [string]$id; state = '?'; detail = 'Not read yet: the server is reading it.'; ageSec = 999999 }; continue }
+        $age = 999999
+        $at = [DateTime]::MinValue
+        if ([DateTime]::TryParse([string]$e.at, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AdjustToUniversal -bor [System.Globalization.DateTimeStyles]::AssumeUniversal, [ref]$at)) { $age = [int][Math]::Max(0, ($now - $at).TotalSeconds) }
+        $out += @{ id = [string]$id; state = [string]$e.state; detail = [string]$e.detail; ageSec = $age }
+    }
+    return @($out)
+}
+
+function Get-StateVersion {
+    if ($null -eq $script:StateMeta) { return 1 }
+    return [int]$script:StateMeta.Ver
+}
+
+function Get-PollSettings {
+    $r = @{ pollSeconds = 30; freshSeconds = 120 }
+    if ($null -ne $script:Config -and $null -ne $script:Config.PSObject.Properties['doorState'] -and $null -ne $script:Config.doorState) {
+        $n = 0
+        if ([int]::TryParse([string]$script:Config.doorState.pollSeconds, [ref]$n) -and $n -ge 1) { $r.pollSeconds = $n }
+        if ([int]::TryParse([string]$script:Config.doorState.freshSeconds, [ref]$n) -and $n -ge 5) { $r.freshSeconds = $n }
+    }
+    return $r
+}
+
+function Test-ServerAccountSet {
+    return ($null -ne $script:Shared -and $null -ne $script:Shared.Account)
+}
+
+function Test-LiveStates {
+    # The page may rely on the server's live states: the server account reads them and its last round was recent.
+    if ($null -eq $script:Shared -or $null -eq $script:Shared.Account) { return $false }
+    $p = $script:Shared.Poll
+    if ($p.State -ne 'ok' -or -not $p.LastOkUtc) { return $false }
+    $ps = Get-PollSettings
+    $limit = [Math]::Max(30, 4 * $ps.pollSeconds)
+    return (([DateTime]::UtcNow - [DateTime]$p.LastOkUtc).TotalSeconds -le $limit)
+}
+
+# ---- worker runspaces (batch jobs and the state poller). The functions of this file are copied into each runspace. --
+
+function Get-ScriptFunctionDefs {
+    # name -> function body text of every top-level function of this script file (the same trick as tests\Test-Unit.ps1).
+    param([string]$Path)
+    $tokens = $null
+    $perrs = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($Path, [ref]$tokens, [ref]$perrs)
+    $defs = [ordered]@{}
+    foreach ($f in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $false)) {
+        $t = $f.Body.Extent.Text
+        $defs[$f.Name] = $t.Substring(1, $t.Length - 2)
+    }
+    return $defs
+}
+
+function New-WorkerRunspace {
+    # A runspace with every function of this script and the given global variables (the functions read them as $script:X).
+    param([hashtable]$Variables)
+    if ($null -eq $script:FunctionDefs) { $script:FunctionDefs = Get-ScriptFunctionDefs -Path $script:SelfPath }
+    $iss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
+    foreach ($n in $script:FunctionDefs.Keys) {
+        $iss.Commands.Add((New-Object System.Management.Automation.Runspaces.SessionStateFunctionEntry($n, [string]$script:FunctionDefs[$n])))
+    }
+    foreach ($k in $Variables.Keys) {
+        $iss.Variables.Add((New-Object System.Management.Automation.Runspaces.SessionStateVariableEntry($k, $Variables[$k], '')))
+    }
+    $rs = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace($iss)
+    $rs.ApartmentState = [System.Threading.ApartmentState]::MTA
+    $rs.Open()
+    return $rs
+}
+
+function Get-WorkerVariables {
+    # The script state every worker needs. Config is the object at the moment of the call.
+    $v = @{
+        Config = $script:Config; StateCache = $script:StateCache; StateMeta = $script:StateMeta; AuditShared = $script:AuditShared
+        AuditPath = $script:AuditPath; LastAuditHash = $script:LastAuditHash; DebugLogPath = $script:DebugLogPath; DataDir = $script:DataDir
+        ScriptDir = $script:ScriptDir; Version = $script:Version; ZeroHash = $script:ZeroHash; ActionNames = $script:ActionNames
+        LogLock = $script:LogLock; Shared = $script:Shared; BehindProxy = $script:BehindProxy; LastDoorCount = 0
+    }
+    return $v
+}
+
+$script:BatchWorkerText = @'
+$ErrorActionPreference = 'Stop'
+$j = $script:Job
+try {
+    $script:Cred = $j.Cred
+    $script:RequestClient = $j.Client
+    $j.State = 'running'
+    $j.Phase = 'Sending'
+    $cb = { param($done, $total, $phase) $script:Job.Done = [int]$done; $script:Job.Total = [int]$total; $script:Job.Phase = [string]$phase }
+    $r = Invoke-DoorBatch -Rid $j.Id -Action $j.Action -Doors @($j.Doors) -Report $j.Report -OnProgress $cb
+    $j.Result = $r
+    $j.Done = [int]$j.Total
+    $j.Phase = 'Done'
+    $j.FinishedAt = [DateTime]::UtcNow
+    $j.State = 'done'
+}
+catch {
+    $e = $_.Exception
+    $j.ErrorCode = 'internal'
+    $j.ErrorStatus = 500
+    if ($e.Data -and $e.Data.Contains('code')) { $j.ErrorCode = [string]$e.Data['code']; $j.ErrorStatus = [int]$e.Data['status'] }
+    $j.Error = [string]$e.Message
+    Write-DebugLog $j.Id ('Batch job failed: ' + $e.Message + "`r`n" + (Format-ExceptionDetail $e)) 'ERROR'
+    $j.Phase = 'Failed'
+    $j.FinishedAt = [DateTime]::UtcNow
+    $j.State = 'failed'
+}
+finally { $script:Cred = $null }
+'@
+
+function Start-BatchJob {
+    # Starts the batch in its own runspace and returns at once. The job carries the operator's own credential.
+    param($Job, $Doors, $Report, $Cred, $Client)
+    $Job.Cred = $Cred
+    $Job.Doors = $Doors
+    $Job.Report = $Report
+    $Job.Client = $Client
+    $vars = Get-WorkerVariables
+    $vars.Job = $Job
+    $rs = New-WorkerRunspace -Variables $vars
+    $ps = [System.Management.Automation.PowerShell]::Create()
+    $ps.Runspace = $rs
+    [void]$ps.AddScript($script:BatchWorkerText)
+    $Job.Rs = $rs
+    $Job.Ps = $ps
+    $Job.Handle = $ps.BeginInvoke()
+}
+
+function Complete-FinishedJobs {
+    # Called from the request loop: frees the runspace of a job that has ended and drops old finished jobs.
+    if ($null -eq $script:Jobs) { return }
+    foreach ($j in @($script:Jobs.Values)) {
+        if ($null -ne $j.Ps -and -not (Test-JobActive -Job $j) -and $j.Handle.IsCompleted) {
+            try { [void]$j.Ps.EndInvoke($j.Handle) } catch { }
+            try { $j.Ps.Dispose() } catch { }
+            try { $j.Rs.Close(); $j.Rs.Dispose() } catch { }
+            $j.Ps = $null
+            $j.Rs = $null
+            $j.Cred = $null
+        }
+    }
+    [void](Remove-OldJobs -Jobs $script:Jobs -Now ([DateTime]::UtcNow))
+}
+
+$script:PollerWorkerText = @'
+$ErrorActionPreference = 'Continue'
+$sh = $script:Shared
+$script:DebugQuiet = $true
+$lastErr = ''
+$doors = $null
+$doorsAt = [DateTime]::MinValue
+while (-not $sh.Stop) {
+    $gen = $sh.AccountGen
+    $cred = $sh.Account
+    if ($null -eq $cred) { $script:Cred = $null; $script:RoundGen = $null; $sh.Poll.State = 'idle'; Start-Sleep -Milliseconds 500; continue }
+    $script:Cred = $cred
+    $script:RoundGen = $gen
+    $script:Config = $sh.Config
+    $ps = Get-PollSettings
+    $t0 = [DateTime]::UtcNow
+    try {
+        if (@(Get-DoorStateChecks).Count -eq 0) { throw 'No door state checks are set (Setup, Door state).' }
+        if ($null -eq $doors -or ($t0 - $doorsAt).TotalSeconds -ge 600 -or $sh.RelistDoors) {
+            $sh.RelistDoors = $false
+            $dl = Get-DoorsFromServer -Rid 'poll'
+            if (-not $dl.ok) { throw ('The door list was refused: ' + $(if ($dl.fault) { $dl.fault } else { 'HTTP ' + $dl.httpStatus })) }
+            $doors = @($dl.doors | ForEach-Object { [pscustomobject]@{ id = [string]$_.id; name = [string]$_.name; extra = $_.extra } })
+            $doorsAt = $t0
+        }
+        $res = Get-DoorStates -Rid 'poll' -Doors $doors
+        $good = @($res.states | Where-Object { $_.state -ne '?' }).Count
+        $bad = @($res.states | Where-Object { $_.state -eq '?' })
+        $sh.Poll.LastRoundAt = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
+        $sh.Poll.LastRoundMs = [int]([DateTime]::UtcNow - $t0).TotalMilliseconds
+        $sh.Poll.Doors = $doors.Count
+        if ($good -gt 0) {
+            $sh.Poll.State = 'ok'; $sh.Poll.Error = ''
+            $sh.Poll.LastLoginOkAt = $sh.Poll.LastRoundAt
+            $sh.Poll.LastOkUtc = [DateTime]::UtcNow
+            if ($bad.Count -gt 0) { $sh.Poll.Error = ($bad.Count.ToString() + ' door(s) not read: ' + [string]$bad[0].detail) }
+        }
+        elseif ($bad.Count -gt 0) { throw ([string]$bad[0].detail) }
+    }
+    catch {
+        $m = Protect-Text -Text ([string]$_.Exception.Message)
+        $sh.Poll.State = 'error'
+        $sh.Poll.Error = $m
+        $sh.Poll.LastRoundAt = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
+        if ($m -ne $lastErr) { Write-DebugLog 'poll' ('Live state read failed: ' + $m) 'NOTE' }
+    }
+    if ($sh.Poll.State -eq 'ok' -and $lastErr) { Write-DebugLog 'poll' 'Live state read works again.' 'NOTE' }
+    $script:Cred = $null
+    $script:RoundGen = $null
+    $lastErr = $(if ($sh.Poll.State -eq 'ok') { '' } else { [string]$sh.Poll.Error })
+    # wait the poll pause; a door that was just acted on (SOAP) is re-read at once
+    $until = [DateTime]::UtcNow.AddSeconds($ps.pollSeconds)
+    while (-not $sh.Stop -and [DateTime]::UtcNow -lt $until) {
+        $item = $null
+        $got = @()
+        $map = $sh.DoorMap
+        # the queue holds door ids only; name and extra come from the server's own door list, unknown ids are skipped
+        while ($sh.Priority.TryDequeue([ref]$item)) { if ($null -ne $map -and $map.ContainsKey([string]$item)) { $got += $map[[string]$item] } }
+        if ($got.Count -gt 0 -and $null -ne $sh.Account) {
+            $script:Cred = $sh.Account
+            $script:RoundGen = $sh.AccountGen
+            try { [void](Get-DoorStates -Rid 'poll' -Doors $got) } catch { }
+            finally { $script:Cred = $null; $script:RoundGen = $null }
+        }
+        if ($sh.Wake) { $sh.Wake = $false; break }
+        Start-Sleep -Milliseconds 300
+    }
+}
+'@
+
+function New-SharedState {
+    # The object the request thread and the poller runspace share.
+    $sh = [hashtable]::Synchronized(@{
+        Stop = $false; Account = $null; AccountGen = 0; Config = $script:Config; RelistDoors = $false; Wake = $false
+        Priority = (New-Object System.Collections.Concurrent.ConcurrentQueue[object]); ReportOwners = [hashtable]::Synchronized(@{}); DoorMap = $null
+        Poll = [hashtable]::Synchronized(@{ State = 'idle'; Error = ''; LastRoundAt = ''; LastRoundMs = 0; Doors = 0; LastLoginOkAt = ''; LastOkUtc = $null })
+    })
+    return $sh
+}
+
+function Start-StatePoller {
+    if ($null -ne $script:PollerPs) { return }
+    $rs = New-WorkerRunspace -Variables (Get-WorkerVariables)
+    $ps = [System.Management.Automation.PowerShell]::Create()
+    $ps.Runspace = $rs
+    [void]$ps.AddScript($script:PollerWorkerText)
+    $script:PollerRs = $rs
+    $script:PollerPs = $ps
+    $script:PollerHandle = $ps.BeginInvoke()
+}
+
+function Stop-StatePoller {
+    if ($null -ne $script:Shared) { $script:Shared.Stop = $true }
+    if ($null -ne $script:PollerPs) {
+        try { [void]$script:PollerHandle.AsyncWaitHandle.WaitOne(3000) } catch { }
+        try { $script:PollerPs.Stop() } catch { }
+        try { $script:PollerPs.Dispose() } catch { }
+        try { $script:PollerRs.Close(); $script:PollerRs.Dispose() } catch { }
+    }
+    $script:PollerPs = $null
+}
+
+function Set-PollerAccount {
+    # $null removes the account (the poller idles); a credential (re)starts it.
+    param($Cred)
+    $script:Shared.Account = $Cred
+    $script:Shared.AccountGen = [int]$script:Shared.AccountGen + 1
+    $script:Shared.Config = $script:Config
+    $script:Shared.RelistDoors = $true
+    $script:Shared.Wake = $true
+    $script:Shared.Poll.State = 'idle'
+    $script:Shared.Poll.Error = ''
+    $script:Shared.Poll.LastRoundAt = ''
+    $script:Shared.Poll.LastOkUtc = $null
+    $script:Shared.Poll.LastLoginOkAt = ''
 }
 
 # ============================================================================
@@ -865,27 +1982,42 @@ function ConvertTo-CsvCell {
 
 function Write-ArmingReport {
     # CSV next to the audit file: doorkeeper-arming-<stamp>.csv. Returns the file name (without folder).
-    param([string]$Label, [string]$Action, $Rows)
+    # -JobId (the batch job, 8 hex characters) is part of the file name; the file is created with CreateNew so two reports can
+    # never overwrite each other. -Owner (the operator) is remembered for the download check.
+    param([string]$Label, [string]$Action, $Rows, [string]$JobId = '', [string]$Owner = '')
     $dir = Split-Path -Parent $script:AuditPath
     if ($dir -and -not (Test-Path -LiteralPath $dir)) { [void](New-Item -ItemType Directory -Path $dir -Force) }
     $now = [DateTime]::UtcNow
     $base = 'doorkeeper-arming-' + $now.ToString('yyyyMMdd-HHmmss')
-    $name = $base + '.csv'
-    $n = 1
-    while (Test-Path -LiteralPath (Join-Path $dir $name)) { $n++; $name = $base + '-' + $n + '.csv' }
+    if ($JobId -match '^[0-9a-f]{8}$') { $base += '-' + $JobId }
     $ts = $now.ToString('yyyy-MM-ddTHH:mm:ssZ')
     $sb = New-Object System.Text.StringBuilder
-    [void]$sb.Append("time,action,group_or_selection,door_id,door_name,location,ok,reply_or_fault,state_after`r`n")
+    [void]$sb.Append("time,action,group_or_selection,door_id,door_name,door_alias,location,ok,reply_or_fault,state_after`r`n")
     foreach ($row in @($Rows)) {
         $loc = Get-DoorLocation -Door $row.Door -Locations $script:Config.locations
         $why = [string]$row.Reply
         if (-not $row.Ok) { $why = [string]$row.Fault }
         $okText = 'false'
         if ($row.Ok) { $okText = 'true' }
-        $cells = @($ts, $Action, $Label, $row.Id, $row.Name, $loc.Text, $okText, $why, [string]$row.State)
+        $cells = @($ts, $Action, $Label, $row.Id, $row.Name, (Get-DoorAlias -Id ([string]$row.Id)), $loc.Text, $okText, $why, [string]$row.State)
         [void]$sb.Append((($cells | ForEach-Object { ConvertTo-CsvCell $_ }) -join ',') + "`r`n")
     }
-    [System.IO.File]::WriteAllText((Join-Path $dir $name), $sb.ToString(), (New-Object System.Text.UTF8Encoding($false)))
+    $bytes = (New-Object System.Text.UTF8Encoding($false)).GetBytes($sb.ToString())
+    $name = $base + '.csv'
+    $n = 1
+    while ($true) {
+        try {
+            $fs = [System.IO.File]::Open((Join-Path $dir $name), [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+            try { $fs.Write($bytes, 0, $bytes.Length) } finally { $fs.Close() }
+            break
+        }
+        catch [System.IO.IOException] {
+            if (-not (Test-Path -LiteralPath (Join-Path $dir $name))) { throw }
+            $n++
+            $name = $base + '-' + $n + '.csv'
+        }
+    }
+    if ($Owner -and $null -ne $script:Shared -and $null -ne $script:Shared.ReportOwners) { $script:Shared.ReportOwners[$name] = $Owner }
     return $name
 }
 
@@ -1083,13 +2215,53 @@ function Get-RedactionSecrets {
         }
         catch { }
     }
+    $sa = $null
+    if ($null -ne $script:Shared) { $sa = $script:Shared.Account }
+    if ($null -ne $sa) {
+        try {
+            $nc2 = $sa.GetNetworkCredential()
+            if ($nc2.Password) {
+                $list.Add($nc2.Password)
+                $list.Add([Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($nc2.UserName + ':' + $nc2.Password)))
+            }
+        }
+        catch { }
+    }
     return $list.ToArray()
+}
+
+function Protect-Text {
+    # ONLY for text that comes from AEOS or the network, applied where it is captured (SOAP response / fault, socket replies and
+    # transcripts, exception messages of the connection, TLS and parsing, poller errors) - never for text that holds request input:
+    # a blanket pass over answers would show an operator whether a guess equals the server account password.
+    # Replaces the password of the credential of this request / job and of the server account (and its Basic-auth form) with
+    # ****, so no AEOS error text that echoes a credential is logged, audited, returned or stored.
+    param([string]$Text)
+    if (-not $Text) { return '' }
+    return (Hide-Secrets -Text $Text -Secrets @(Get-RedactionSecrets))
+}
+
+function Protect-Transcript {
+    # Socket transcript: RECV lines come from AEOS and are masked; SEND lines are what we sent (an admin's own typed command) and
+    # stay as sent - a blanket pass would show a typed guess of the server password as "****". The login SEND line is already
+    # masked at its source (LoginShown).
+    param([string[]]$Lines)
+    $out = @()
+    foreach ($l in @($Lines)) {
+        if ([string]$l -like 'RECV *') { $out += (Protect-Text -Text ([string]$l)) } else { $out += [string]$l }
+    }
+    return @($out)
 }
 
 function Write-DebugLog {
     param([string]$Rid, [string]$Message, [string]$Level = 'INFO')
     if (-not $script:DebugLogPath) { return }
+    # The poller runspace logs only warnings, errors and NOTE lines (a state round would write thousands of lines).
+    if ($script:DebugQuiet -and $Level -eq 'INFO') { return }
+    $lockObj = $script:LogLock
+    $locked = $false
     try {
+        if ($null -ne $lockObj) { $locked = [System.Threading.Monitor]::TryEnter($lockObj, 2000) }
         $text = Hide-Secrets -Text $Message -Secrets @(Get-RedactionSecrets)
         $ts = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
         $prefix = $ts + ' [' + $Rid + '] ' + $Level + ' '
@@ -1106,6 +2278,7 @@ function Write-DebugLog {
         [System.IO.File]::AppendAllText($script:DebugLogPath, $out, (New-Object System.Text.UTF8Encoding($false)))
     }
     catch { }
+    finally { if ($locked) { [System.Threading.Monitor]::Exit($lockObj) } }
 }
 
 function Get-EnvironmentText {
@@ -1144,16 +2317,28 @@ function Write-StartupBlock {
 }
 
 function Initialize-Paths {
-    $script:AuditPath = Resolve-DataPath -Value ([string]$script:Config.auditFile) -BaseDir $script:ScriptDir -DefaultName 'doorkeeper-audit.jsonl'
+    # Paths of the audit and debug files. The head of the audit chain is read only for a path that has not been read yet (the
+    # first start, or a real change of auditFile): a config save with the same path keeps the head in memory, because a job may be
+    # appending at that moment. Head read and appends use the same lock.
+    $newAudit = Resolve-DataPath -Value ([string]$script:Config.auditFile) -BaseDir $script:ScriptDir -DefaultName 'doorkeeper-audit.jsonl'
     $script:DebugLogPath = Resolve-DataPath -Value ([string]$script:Config.debugLogFile) -BaseDir $script:ScriptDir -DefaultName 'doorkeeper-debug.log'
-    $script:LastAuditHash = $script:ZeroHash
-    $recs = @(Read-AuditRecords)
-    if ($recs.Count -gt 0) {
-        $last = $recs[$recs.Count - 1]
-        if (-not $last.PSObject.Properties['parseError'] -and $last.hash) { $script:LastAuditHash = [string]$last.hash }
+    if ($null -eq $script:AuditShared) { $script:AuditShared = [hashtable]::Synchronized(@{ Hash = $script:ZeroHash; Path = '' }) }
+    [System.Threading.Monitor]::Enter($script:AuditShared)
+    try {
+        if ([string]$script:AuditShared.Path -ne $newAudit) {
+            $script:AuditPath = $newAudit
+            $script:LastAuditHash = $script:ZeroHash
+            $recs = @(Read-AuditRecords)
+            if ($recs.Count -gt 0) {
+                $last = $recs[$recs.Count - 1]
+                if (-not $last.PSObject.Properties['parseError'] -and $last.hash) { $script:LastAuditHash = [string]$last.hash }
+            }
+            $script:AuditShared.Hash = $script:LastAuditHash
+            $script:AuditShared.Path = $newAudit
+        }
     }
+    finally { [System.Threading.Monitor]::Exit($script:AuditShared) }
 }
-
 function Read-AuditRecords {
     if (-not (Test-Path -LiteralPath $script:AuditPath)) { return @() }
     $fs = [System.IO.File]::Open($script:AuditPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
@@ -1169,25 +2354,47 @@ function Read-AuditRecords {
 }
 
 function Write-AuditRecord {
-    param([string]$Action, [string]$DoorId, [string]$DoorName, [int]$HttpStatus, [bool]$Ok, [string]$Fault, [string]$Batch = '')
+    # Every new record is v4 (the hash covers every field, fault included): it also holds the computer name (where the console runs, so "from where"), the door alias and
+    # the client address (clientIp) of the request. windowsUser is the Windows user IIS passed for the request when the
+    # console runs behind IIS, else the account that runs the console. The writes of the request thread and of the batch
+    # job runspaces are serialized by one lock, and the hash chain continues from the shared last hash.
+    # -AeosUser is for a login that was refused (no credential is kept then).
+    param([string]$Action, [string]$DoorId, [string]$DoorName, [int]$HttpStatus, [bool]$Ok, [string]$Fault, [string]$Batch = '',
+        [string]$AeosUser = '', [string]$DoorAlias = '')
     $ts = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
     $win = [Environment]::UserDomainName + '\' + [Environment]::UserName
-    $aeos = ''
-    if ($null -ne $script:Cred) { $aeos = $script:Cred.UserName }
-    $prev = $script:LastAuditHash
-    $hash = Get-AuditHash -PrevHash $prev -Ts $ts -WindowsUser $win -AeosUser $aeos -Action $Action -DoorId $DoorId -DoorName $DoorName -HttpStatus $HttpStatus -Ok $Ok -Batch $Batch
-    $rec = [ordered]@{
-        ts = $ts; windowsUser = $win; aeosUser = $aeos; action = $Action; doorId = $DoorId; doorName = $DoorName
-        httpStatus = $HttpStatus; ok = $Ok; fault = $Fault; prevHash = $prev; hash = $hash
+    $clientIp = ''
+    if ($null -ne $script:RequestClient) {
+        $clientIp = [string]$script:RequestClient.Ip
+        if ($null -ne $script:RequestClient.WindowsUser) { $win = [string]$script:RequestClient.WindowsUser }
     }
-    if ($Batch) { $rec['batch'] = $Batch }
-    $line = ConvertTo-Json -InputObject $rec -Compress
-    $dir = Split-Path -Parent $script:AuditPath
-    if ($dir -and -not (Test-Path -LiteralPath $dir)) { [void](New-Item -ItemType Directory -Path $dir -Force) }
-    [System.IO.File]::AppendAllText($script:AuditPath, $line + "`n", (New-Object System.Text.UTF8Encoding($false)))
-    $script:LastAuditHash = $hash
+    $aeos = $AeosUser
+    if (-not $aeos -and $null -ne $script:Cred) { $aeos = $script:Cred.UserName }
+    if (-not $DoorAlias -and $DoorId) { $DoorAlias = Get-DoorAlias -Id $DoorId }
+    $computer = [string]$env:COMPUTERNAME
+    $shared = $script:AuditShared
+    $lockObj = $shared
+    if ($null -eq $lockObj) { $lockObj = $script:AuditPath }
+    [System.Threading.Monitor]::Enter($lockObj)
+    try {
+        $prev = $script:LastAuditHash
+        if ($null -ne $shared -and $shared.Hash) { $prev = [string]$shared.Hash }
+        $hash = Get-AuditHash -PrevHash $prev -Ts $ts -WindowsUser $win -AeosUser $aeos -Action $Action -DoorId $DoorId -DoorName $DoorName -HttpStatus $HttpStatus -Ok $Ok -Batch $Batch `
+            -Version 4 -Computer $computer -DoorAlias $DoorAlias -ClientIp $clientIp -Fault $Fault
+        $rec = [ordered]@{
+            v = 4; ts = $ts; windowsUser = $win; computer = $computer; clientIp = $clientIp; aeosUser = $aeos; action = $Action; doorId = $DoorId; doorName = $DoorName; doorAlias = $DoorAlias
+            httpStatus = $HttpStatus; ok = $Ok; fault = $Fault; prevHash = $prev; hash = $hash
+        }
+        if ($Batch) { $rec['batch'] = $Batch }
+        $line = ConvertTo-Json -InputObject $rec -Compress
+        $dir = Split-Path -Parent $script:AuditPath
+        if ($dir -and -not (Test-Path -LiteralPath $dir)) { [void](New-Item -ItemType Directory -Path $dir -Force) }
+        [System.IO.File]::AppendAllText($script:AuditPath, $line + "`n", (New-Object System.Text.UTF8Encoding($false)))
+        $script:LastAuditHash = $hash
+        if ($null -ne $shared) { $shared.Hash = $hash }
+    }
+    finally { [System.Threading.Monitor]::Exit($lockObj) }
 }
-
 function Save-ConfigFile {
     param($Config, [string]$Path)
     $text = ConvertTo-Json -InputObject $Config -Depth 10
@@ -1344,7 +2551,7 @@ function Invoke-AeosHttp {
         $sw.Stop()
         foreach ($l in $cb.Lines) { Write-DebugLog $Rid $l }
         Write-DebugLog $Rid ('!!! REQUEST FAILED [' + $What + '] after ' + $sw.ElapsedMilliseconds + ' ms' + "`r`n" + (Format-ExceptionDetail $_.Exception)) 'ERROR'
-        throw (New-ApiException 502 'aeos_unreachable' ('Cannot send the request to AEOS: ' + $_.Exception.Message))
+        throw (New-ApiException 502 'aeos_unreachable' ('Cannot send the request to AEOS: ' + (Protect-Text -Text $_.Exception.Message)))
     }
     $sw.Stop()
     foreach ($l in $cb.Lines) { Write-DebugLog $Rid $l }
@@ -1353,7 +2560,7 @@ function Invoke-AeosHttp {
         $e = $webEx
         while ($null -ne $e) { $msgs.Add($e.Message); $e = $e.InnerException }
         Write-DebugLog $Rid ('!!! NO RESPONSE [' + $What + '] after ' + $sw.ElapsedMilliseconds + ' ms' + "`r`n" + (Format-ExceptionDetail $webEx)) 'ERROR'
-        throw (New-ApiException 502 'aeos_unreachable' ('Cannot reach AEOS (' + $webEx.Status + '): ' + ($msgs -join ' -> ')))
+        throw (New-ApiException 502 'aeos_unreachable' ('Cannot reach AEOS (' + $webEx.Status + '): ' + (Protect-Text -Text ($msgs -join ' -> '))))
     }
     $status = [int]$resp.StatusCode
     $respHeaders = New-Object System.Collections.Generic.List[string]
@@ -1407,8 +2614,9 @@ function Invoke-SoapCall {
         -SoapActionHeader $h.SoapActionHeader -Body $envelope -Basic ($cfg.auth -eq 'basic')
     $fault = Get-SoapFault $r.Body
     $ok = ($r.Status -ge 200 -and $r.Status -lt 300 -and $null -eq $fault)
+    if ($fault) { $fault = Protect-Text -Text $fault }
     Write-DebugLog $Rid ('Call result [' + $What + ']: httpStatus=' + $r.Status + ' ok=' + $ok + $(if ($fault) { ' fault="' + $fault + '"' } else { '' }))
-    return @{ httpStatus = $r.Status; ok = $ok; fault = $fault; response = (Format-XmlPretty $r.Body); rawText = $r.Body }
+    return @{ httpStatus = $r.Status; ok = $ok; fault = $fault; response = (Protect-Text -Text (Format-XmlPretty $r.Body)); rawText = (Protect-Text -Text $r.Body) }
 }
 
 # ============================================================================
@@ -1484,9 +2692,15 @@ function Invoke-SocketCommandList {
     $stop = $null
     $n = @($Commands).Count
     $i = 0
+    $matched = @{}
     foreach ($c in @($Commands)) {
         $i++
         $r = [pscustomobject]@{ Key = $c.Key; Sent = $false; Ok = $false; Reply = ''; Fault = $null }
+        $grp = ''
+        if ($c -is [System.Collections.IDictionary] -and $c.Contains('StopGroup')) { $grp = [string]$c['StopGroup'] }
+        # A command with a StopGroup is skipped (Ok, not sent) once an earlier command of that group had a reply that
+        # matched its StopPattern: Resolve-DoorState stops at the first matching check, so the skipped ones are never read.
+        if ($grp -and $matched.ContainsKey($grp)) { $r.Ok = $true; $results.Add($r); continue }
         if ($null -ne $stop) { $r.Fault = 'Not sent: ' + $stop; $results.Add($r); continue }
         $shown = [string]$c.Shown
         if (-not $shown) { $shown = [string]$c.Text }
@@ -1500,6 +2714,7 @@ function Invoke-SocketCommandList {
             $r.Reply = $reply
             if ([string]$c.Pattern -and -not [regex]::IsMatch($reply, [string]$c.Pattern)) { $r.Fault = 'The reply did not match the success pattern: ' + $reply }
             else { $r.Ok = $true }
+            if ($grp -and $c['StopPattern'] -and [regex]::IsMatch($reply, [string]$c['StopPattern'])) { $matched[$grp] = $true }
         }
         $results.Add($r)
     }
@@ -1542,7 +2757,7 @@ function Invoke-SocketSession {
         }
         catch {
             Write-DebugLog $Rid ('!!! SOCKET connect failed' + "`r`n" + (Format-ExceptionDetail $_.Exception)) 'ERROR'
-            throw (New-ApiException 502 'socket_unreachable' ('Cannot connect to the AEOS socket ' + $hostName + ':' + $port + ': ' + $_.Exception.Message))
+            throw (New-ApiException 502 'socket_unreachable' ('Cannot connect to the AEOS socket ' + $hostName + ':' + $port + ': ' + (Protect-Text -Text $_.Exception.Message)))
         }
         Write-DebugLog $Rid ('SOCKET connected to ' + $tcp.Client.RemoteEndPoint)
         if ($useTls) {
@@ -1550,7 +2765,15 @@ function Invoke-SocketSession {
             $cb = New-Object AeosTlsCallback
             $cb.Skip = ($sk.tlsSkipValidation -eq $true)
             $ssl = New-Object System.Net.Security.SslStream($tcp.GetStream(), $false, $cb.Callback)
-            try { $ssl.AuthenticateAsClient($hostName, $null, [System.Security.Authentication.SslProtocols]::Tls12, $false) }
+            try {
+                # bounded by the connect timeout: a server that accepts the connection and then says nothing must not hold the request
+                $hs = $ssl.BeginAuthenticateAsClient($hostName, $null, [System.Security.Authentication.SslProtocols]::Tls12, $false, $null, $null)
+                if (-not $hs.AsyncWaitHandle.WaitOne($tmo)) {
+                    try { $tcp.Close() } catch { }
+                    throw ('no TLS handshake within ' + $cfg.timeoutSec + ' s')
+                }
+                $ssl.EndAuthenticateAsClient($hs)
+            }
             catch {
                 foreach ($l in $cb.Lines) { Write-DebugLog $Rid $l }
                 Write-DebugLog $Rid ('!!! SOCKET TLS handshake failed' + "`r`n" + (Format-ExceptionDetail $_.Exception)) 'ERROR'
@@ -1559,7 +2782,7 @@ function Invoke-SocketSession {
                 while ($null -ne $ie) { $m = $m + ' -> ' + $ie.Message; $ie = $ie.InnerException }
                 $hint = ''
                 if (-not $cb.Skip) { $hint = ' (self-signed AEOS certificate? tick "Skip TLS certificate validation" in the Socket interface settings)' }
-                throw (New-ApiException 502 'socket_tls' ('TLS handshake with the AEOS socket failed: ' + $m + $hint))
+                throw (New-ApiException 502 'socket_tls' ('TLS handshake with the AEOS socket failed: ' + (Protect-Text -Text $m) + $hint))
             }
             foreach ($l in $cb.Lines) { Write-DebugLog $Rid $l }
             Write-DebugLog $Rid ('SOCKET TLS ' + $ssl.SslProtocol + ', cipher ' + $ssl.CipherAlgorithm + '/' + $ssl.CipherStrength)
@@ -1608,13 +2831,20 @@ function Invoke-SocketSession {
         try { $tcp.Close() } catch { }
         Write-DebugLog $Rid ('<<< SOCKET [' + $What + '] closed after ' + $sw.ElapsedMilliseconds + ' ms')
     }
+    # replies, faults and the transcript come from AEOS: masked here, before anything combines or stores them
+    foreach ($rr in @($results)) {
+        if ($null -ne $rr.Reply) { $rr.Reply = Protect-Text -Text ([string]$rr.Reply) }
+        if ($rr.Fault) { $rr.Fault = Protect-Text -Text ([string]$rr.Fault) }
+    }
+    if ($session.Fault) { $session.Fault = Protect-Text -Text ([string]$session.Fault) }
+    $session.Transcript = @(Protect-Transcript -Lines @($session.Transcript.ToArray()))
     $out.results = @($results)
     $bad = @($results | Where-Object { -not $_.Ok })
     $out.ok = ($results.Count -gt 0 -and $bad.Count -eq 0)
     if ($results.Count -gt 0) { $out.reply = [string]$results[0].Reply }
     $out.fault = $session.Fault
     if (-not $out.fault -and $bad.Count -gt 0) { $out.fault = [string]$bad[0].Fault }
-    $out.transcript = @($session.Transcript.ToArray())
+    $out.transcript = @($session.Transcript)
     Write-DebugLog $Rid ('Call result [' + $What + ']: socket ok=' + $out.ok + $(if ($out.fault) { ' fault="' + $out.fault + '"' } else { '' }))
     return $out
 }
@@ -1676,13 +2906,18 @@ function Get-DoorStatePlan {
 
 function Get-DoorStateCommands {
     # Session commands for a plan: the check commands of every door without an error, door by door.
-    param($Plan)
+    # With -Checks each command also carries StopGroup (the door) and StopPattern (the check's match pattern): the session
+    # sends the checks of a door one by one and skips the rest of that door once a reply matches (a Locked door needs one command).
+    param($Plan, $Checks = $null)
     $cmds = @()
+    $chk = @($Checks)
     $di = 0
     foreach ($p in @($Plan)) {
         $ci = 0
         foreach ($t in @($p.Commands)) {
-            $cmds += @{ Text = [string]$t; Shown = [string]$t; Pattern = ''; Key = ('state:' + $di + ':' + $ci) }
+            $c = @{ Text = [string]$t; Shown = [string]$t; Pattern = ''; Key = ('state:' + $di + ':' + $ci) }
+            if ($null -ne $Checks -and $ci -lt $chk.Count) { $c.StopGroup = ('state:' + $di); $c.StopPattern = [string]$chk[$ci].matchPattern }
+            $cmds += $c
             $ci++
         }
         $di++
@@ -1730,6 +2965,13 @@ function Get-DoorStatesFromResults {
     return @($out)
 }
 
+function Assert-RoundCurrent {
+    # A poller round belongs to one server account: when the account is replaced or removed the round stops and stores nothing.
+    if ($null -ne $script:RoundGen -and $null -ne $script:Shared -and [int]$script:Shared.AccountGen -ne [int]$script:RoundGen) {
+        throw (New-ApiException 409 'account_changed' 'The server account changed during the read.')
+    }
+}
+
 function Get-DoorStates {
     # One socket session for all listed doors: login + init once, then the state checks of every door.
     param([string]$Rid, $Doors)
@@ -1741,10 +2983,12 @@ function Get-DoorStates {
     $max = Get-MaxDoorsPerRefresh
     $states = @()
     $login = $null
+    $obs0 = [DateTime]::UtcNow
     for ($off = 0; $off -lt $list.Count; $off += $max) {
+        Assert-RoundCurrent
         $part = @($list[$off..([Math]::Min($off + $max, $list.Count) - 1)])
         $plan = @(Get-DoorStatePlan -Doors $part -Checks $checks)
-        $cmds = @(Get-DoorStateCommands -Plan $plan)
+        $cmds = @(Get-DoorStateCommands -Plan $plan -Checks $checks)
         $results = @()
         if ($cmds.Count -gt 0) {
             if ($null -eq $login) {
@@ -1760,6 +3004,8 @@ function Get-DoorStates {
         }
         $states += @(Get-DoorStatesFromResults -Plan $plan -Checks $checks -Results $results -OtherwiseLabel ([string]$script:Config.doorState.otherwiseLabel))
     }
+    Assert-RoundCurrent
+    Update-StateCache -States $states -ObservedAt $obs0
     return @{ states = @($states) }
 }
 
@@ -1782,7 +3028,7 @@ function Invoke-SocketDoorAction {
     $plan = @()
     if ($checks.Count -gt 0) {
         $plan = @(Get-DoorStatePlan -Doors @([pscustomobject]@{ id = $Id; name = $Name; extra = $Extra }) -Checks $checks)
-        $commands += @(Get-DoorStateCommands -Plan $plan)
+        $commands += @(Get-DoorStateCommands -Plan $plan -Checks $checks)
     }
     $sess = Invoke-SocketSession -Rid $Rid -What $Action -LoginText $login.Text -LoginShown $login.Shown -Commands $commands
     $r0 = $sess.results[0]
@@ -1792,6 +3038,7 @@ function Invoke-SocketDoorAction {
         $st = @(Get-DoorStatesFromResults -Plan $plan -Checks $checks -Results @($sess.results | Select-Object -Skip 1) -OtherwiseLabel ([string]$script:Config.doorState.otherwiseLabel))
         $res.state = [string]$st[0].state
         $res.stateDetail = [string]$st[0].detail
+        Update-StateCache -States $st
     }
     return $res
 }
@@ -1821,6 +3068,67 @@ function Invoke-SocketRaw {
     return @{ ok = $result.ok; fault = $result.fault; reply = $result.reply; transcript = $result.transcript }
 }
 
+function Test-AeosLogin {
+    # Checks the typed credential (already in $script:Cred) against AEOS before it is kept. Socket interface set up with a
+    # login command that holds {{password}}: one session with only the login; its reply must match the login success pattern.
+    # Otherwise, when the list doors action is mapped: one list doors call, which must not answer 401 or 403.
+    # With neither there is nothing to check against yet (first setup): the login is accepted, as before.
+    # Returns @{ ok; checked; refused; reason }. A connection failure throws the API exception.
+    param([string]$Rid)
+    $cfg = $script:Config
+    $sk = $cfg.socket
+    $port = 0
+    [void][int]::TryParse([string]$sk.port, [ref]$port)
+    $tpl = [string]$sk.loginTemplate
+    # An EMPTY login success pattern is not a check (any reply would pass): the socket is used only with a pattern.
+    $socketReady = ($tpl.Contains('{{password}}') -and ([string]$sk.loginSuccessPattern).Trim() -and $port -ge 1 -and $port -le 65535 -and [bool](Resolve-SocketHost -SocketHost ([string]$sk.host) -AeosUrl ([string]$cfg.aeosUrl)))
+    if ($socketReady) {
+        $login = Get-SocketLoginText -Rid $Rid
+        if ($login.Error) { return @{ ok = $false; checked = $true; refused = $true; reason = [string]$login.Error } }
+        $sess = Invoke-SocketSession -Rid $Rid -What 'login check' -LoginText $login.Text -LoginShown $login.Shown -Commands @()
+        if ($sess.fault) { return @{ ok = $false; checked = $true; refused = (([string]$sess.fault) -like 'login rejected*'); reason = [string]$sess.fault } }
+        Write-DebugLog $Rid 'Login checked over the socket interface: accepted.'
+        return @{ ok = $true; checked = $true; refused = $false; reason = '' }
+    }
+    $ld = $cfg.actions.listDoors
+    if (-not [string]$cfg.aeosUrl -or -not [string]$ld.operation) {
+        Write-DebugLog $Rid 'Login not checked: neither the socket login nor the list doors action is set up yet.'
+        # Behind the proxy an unchecked login would let anybody in: refused. On the local console the first setup still works.
+        if ($script:BehindProxy) {
+            return @{ ok = $false; checked = $false; refused = $false; notConfigured = $true; reason = 'AEOS login cannot be checked: set up the AEOS connection on the server first.' }
+        }
+        return @{ ok = $true; checked = $false; refused = $false; reason = '' }
+    }
+    $ps = 0
+    [void][int]::TryParse([string]$ld.pageSize, [ref]$ps)
+    $body = ([string]$ld.body).Replace('{{start}}', '0').Replace('{{pageSize}}', [string]$ps)
+    $r = Invoke-SoapCall -Rid $Rid -What 'login check' -SoapAction ([string]$ld.soapAction) -BodyTemplate $body
+    # Only an affirmative answer (HTTP 2xx and no SOAP fault) accepts the login: a 500 or a fault is a refusal too.
+    if (-not $r.ok) {
+        $why = 'AEOS answered HTTP ' + $r.httpStatus + ' to the list doors call.'
+        if ($r.fault -and $r.httpStatus -ge 200 -and $r.httpStatus -lt 300) { $why = 'AEOS answered the list doors call with a fault: ' + $r.fault }
+        return @{ ok = $false; checked = $true; refused = $true; reason = $why }
+    }
+    Write-DebugLog $Rid ('Login checked with the list doors call (HTTP ' + $r.httpStatus + '): accepted.')
+    return @{ ok = $true; checked = $true; refused = $false; reason = '' }
+}
+
+function Set-DoorAliases {
+    # Updates is an id -> alias table; an empty alias removes the entry. Everything is checked first, then the config is saved.
+    param($Updates)
+    $cur = [ordered]@{}
+    if ($null -ne $script:Config.aliases) { foreach ($p in $script:Config.aliases.PSObject.Properties) { $cur[$p.Name] = [string]$p.Value } }
+    foreach ($k in @($Updates.Keys)) {
+        $v = ([string]$Updates[$k]).Trim()
+        if (-not $v) { if ($cur.Contains($k)) { $cur.Remove($k) }; continue }
+        $e = Test-AliasEntry -Id $k -Alias $v
+        if ($e) { throw (New-ApiException 400 'invalid_alias' $e) }
+        $cur[$k] = $v
+    }
+    $script:Config.aliases = [pscustomobject]$cur
+    Save-ConfigFile -Config $script:Config -Path $script:ConfigPath
+}
+
 function Get-WsdlInfoFromServer {
     param([string]$Rid)
     $cfg = $script:Config
@@ -1834,7 +3142,7 @@ function Get-WsdlInfoFromServer {
     try { return (Read-WsdlInfo $r.Body) }
     catch {
         Write-DebugLog $Rid ('WSDL parse failed' + "`r`n" + (Format-ExceptionDetail $_.Exception)) 'ERROR'
-        throw (New-ApiException 502 'wsdl_parse' ('The WSDL could not be parsed: ' + $_.Exception.Message))
+        throw (New-ApiException 502 'wsdl_parse' ('The WSDL could not be parsed: ' + (Protect-Text -Text $_.Exception.Message)))
     }
 }
 
@@ -1868,6 +3176,10 @@ function Invoke-DoorAction {
     elseif ($null -ne $caught) { $fault = $caught.Message }
     Write-AuditRecord -Action $Action -DoorId $Id -DoorName $Name -HttpStatus $status -Ok $ok -Fault $fault
     Write-DebugLog $Rid ('Audit record written: action=' + $Action + ' doorId=' + $Id + ' ok=' + $ok)
+    # A socket action reads the state in the same session. After a SOAP action the poller re-reads that door at once.
+    if (-not $socket -and $null -ne $script:Shared -and $null -ne $script:Shared.Account -and @(Get-DoorStateChecks).Count -gt 0) {
+        $script:Shared.Priority.Enqueue([string]$Id)
+    }
     if ($null -ne $caught) { throw $caught }
     if ($socket) {
         $o = @{ ok = $result.ok; transport = 'socket'; httpStatus = 0; fault = $result.fault; reply = $result.reply; response = $result.reply }
@@ -1877,12 +3189,29 @@ function Invoke-DoorAction {
     return @{ ok = $result.ok; httpStatus = $result.httpStatus; fault = $result.fault; response = $result.response }
 }
 
+function Assert-BatchAllowed {
+    # The checks Invoke-DoorBatch makes before it sends anything, so a bad batch is refused by the request itself (400 / 401)
+    # and only a good one becomes a background job.
+    param([string]$Action, $Doors)
+    if (@('lock', 'unlock', 'access', 'normal') -notcontains $Action) { throw (New-ApiException 400 'bad_action' 'Unknown action.') }
+    $a = $script:Config.actions.$Action
+    if ([string]$a.transport -eq 'socket') {
+        if (-not $a.command) { throw (New-ApiException 400 'not_configured' ('The ' + $Action + ' action has no socket command on the Setup tab.')) }
+    }
+    else {
+        if (-not $a.operation) { throw (New-ApiException 400 'not_configured' ('The ' + $Action + ' action is not mapped on the Setup tab.')) }
+        Assert-CanCall
+    }
+    if (@($Doors | Where-Object { $null -ne $_ }).Count -eq 0) { throw (New-ApiException 400 'bad_request' 'Select at least one door.') }
+}
+
 function Invoke-DoorBatch {
     # One action on many doors. Socket transport: ONE session (login + init once, the action command of every door,
     # then the state checks of every door). SOAP transport: one call per door in turn. A door with a refused value is
     # reported and not sent; the others go on. One audit record per door, tagged batch:<request id>.
     # -Report (an object with a label) also writes the arming report CSV next to the audit file; the answer names it.
-    param([string]$Rid, [string]$Action, $Doors, $Report = $null)
+    # -OnProgress (a scriptblock: done, total, phase) is called as the batch advances; the batch job of the page uses it.
+    param([string]$Rid, [string]$Action, $Doors, $Report = $null, $OnProgress = $null)
     if (@('lock', 'unlock', 'access', 'normal') -notcontains $Action) { throw (New-ApiException 400 'bad_action' 'Unknown action.') }
     $a = $script:Config.actions.$Action
     $socket = ([string]$a.transport -eq 'socket')
@@ -1905,6 +3234,7 @@ function Invoke-DoorBatch {
     }
     $caught = $null
     $states = $null
+    if ($null -ne $OnProgress) { & $OnProgress 0 $list.Count 'Sending' }
     if ($socket) {
         $send = @()
         foreach ($row in $rows) {
@@ -1922,6 +3252,7 @@ function Invoke-DoorBatch {
             $part = @($send[$off..([Math]::Min($off + $max, $send.Count) - 1)])
             if ($null -ne $stopWhy) {
                 foreach ($row in $part) { $row.Ok = $false; $row.Fault = 'Not sent: ' + $stopWhy }
+                if ($null -ne $OnProgress) { & $OnProgress ([Math]::Min($off + $part.Count, $list.Count)) $list.Count 'Sending' }
                 continue
             }
             $cmds = @()
@@ -1929,7 +3260,7 @@ function Invoke-DoorBatch {
             $plan = @()
             if ($checks.Count -gt 0) {
                 $plan = @(Get-DoorStatePlan -Doors @($part | ForEach-Object { $_.Door }) -Checks $checks)
-                $cmds += @(Get-DoorStateCommands -Plan $plan)
+                $cmds += @(Get-DoorStateCommands -Plan $plan -Checks $checks)
             }
             try {
                 if ($null -eq $login) {
@@ -1954,11 +3285,15 @@ function Invoke-DoorBatch {
                 if ($off -eq 0) { $caught = $_.Exception; $stopWhy = $_.Exception.Message }
                 else { $stopWhy = $_.Exception.Message; Write-DebugLog $Rid ('Batch stopped after ' + $off + ' door(s): ' + $stopWhy) 'ERROR' }
             }
+            if ($null -ne $OnProgress) { & $OnProgress ([Math]::Min($off + $part.Count + ($list.Count - $send.Count), $list.Count)) $list.Count 'Sending' }
         }
     }
     else {
         $stopWhy = $null
+        $sent = 0
         foreach ($row in $rows) {
+            $sent++
+            if ($null -ne $OnProgress) { & $OnProgress ($sent - 1) $list.Count 'Sending' }
             if ($null -ne $stopWhy) { $row.Fault = 'Not sent: ' + $stopWhy; continue }
             try {
                 $r = Invoke-SoapCall -Rid $Rid -What $Action -SoapAction ([string]$a.soapAction) -BodyTemplate ([string]$a.body) -Id $row.Id -Name $row.Name
@@ -1969,6 +3304,7 @@ function Invoke-DoorBatch {
             }
             catch { $row.Fault = $_.Exception.Message; $stopWhy = $_.Exception.Message }
         }
+        if ($null -ne $OnProgress) { & $OnProgress $list.Count $list.Count 'Reading states' }
         if ($checks.Count -gt 0) {
             try { $states = @((Get-DoorStates -Rid $Rid -Doors @($rows | ForEach-Object { $_.Door })).states) }
             catch {
@@ -1978,11 +3314,13 @@ function Invoke-DoorBatch {
         }
     }
     $okCount = 0
+    if ($null -ne $OnProgress) { & $OnProgress $list.Count $list.Count 'Writing the audit' }
     foreach ($row in $rows) {
         if ($row.Ok) { $okCount++ }
         Write-AuditRecord -Action $Action -DoorId $row.Id -DoorName $row.Name -HttpStatus $row.HttpStatus -Ok $row.Ok -Fault $row.Fault -Batch $tag
     }
     Write-DebugLog $Rid ('Audit records written: ' + $rows.Count + ' x action=' + $Action + ' ' + $tag + ' ok=' + $okCount)
+    if ($socket -and $null -ne $states) { Update-StateCache -States $states }
     if ($null -ne $caught) { throw $caught }
     # states come one per door in plan order (socket: only the doors that were sent; SOAP: all doors)
     if ($null -ne $states) {
@@ -2007,7 +3345,9 @@ function Invoke-DoorBatch {
         try {
             $lab = ([string](Get-JsonProp $Report 'label')).Trim()
             if ($lab.Length -gt 200) { $lab = $lab.Substring(0, 200) }
-            $reportFile = Write-ArmingReport -Label $lab -Action $Action -Rows $rows
+            $ownerName = ''
+            if ($null -ne $script:Cred) { $ownerName = [string]$script:Cred.UserName }
+            $reportFile = Write-ArmingReport -Label $lab -Action $Action -Rows $rows -JobId $Rid -Owner $ownerName
             Write-DebugLog $Rid ('Arming report written: ' + $reportFile)
         }
         catch { $reportError = $_.Exception.Message; Write-DebugLog $Rid ('Arming report not written: ' + $reportError) 'ERROR' }
@@ -2066,7 +3406,7 @@ function Get-DoorsFromServer {
             try { $d = @(ConvertFrom-DoorList -Text $r.rawText -ItemElement ([string]$a.itemElement) -IdField ([string]$a.idField) -NameField ([string]$a.nameField) -ExtraFields @($a.extraFields)) }
             catch {
                 Write-DebugLog $Rid ('Door list parse failed (page ' + $Page + ')' + "`r`n" + (Format-ExceptionDetail $_.Exception)) 'ERROR'
-                throw (New-ApiException 502 'parse_failed' ('The response could not be parsed (page ' + $Page + '): ' + $_.Exception.Message))
+                throw (New-ApiException 502 'parse_failed' ('The response could not be parsed (page ' + $Page + '): ' + (Protect-Text -Text $_.Exception.Message)))
             }
             Write-DebugLog $Rid ('Door list page ' + $Page + ': ' + $d.Count + ' door(s) with element "' + $a.itemElement + '"')
         }
@@ -2082,7 +3422,9 @@ function Get-DoorsFromServer {
         if (-not $why) { $why = 'HTTP ' + $res.httpStatus }
         $res.fault = 'page ' + $res.failedPage + ' failed after ' + @($res.doors).Count + ' door(s): ' + $why
     }
-    return @{ ok = $res.ok; httpStatus = $res.httpStatus; fault = $res.fault; doors = @($res.doors); raw = $res.raw; pages = $res.pages }
+    if ($res.ok) { Set-ServerDoors -Doors @($res.doors) }
+    Save-StateCache -MinAgeSec 0
+    return @{ ok = $res.ok; httpStatus = $res.httpStatus; fault = $res.fault; doors = @($res.doors); raw = $res.raw; pages = $res.pages; lastKnown = (Get-LastKnownStates -Doors $res.doors) }
 }
 
 # ============================================================================
@@ -2154,6 +3496,17 @@ function Read-RequestText {
     return $text
 }
 
+function Get-AuditSelection {
+    # The audit filters of the query string (user, door, action, from, to); a bad date is a 400.
+    param($Request, $Records)
+    $qs = $Request.QueryString
+    foreach ($k in @('from', 'to')) {
+        $v = [string]$qs[$k]
+        if ($v -and $v -notmatch '^\d{4}-\d\d-\d\d$') { throw (New-ApiException 400 'bad_request' ('The ' + $k + ' date must look like 2026-11-13.')) }
+    }
+    return (Select-AuditRecords -Records $Records -User ([string]$qs['user']) -Door ([string]$qs['door']) -Action ([string]$qs['action']) -From ([string]$qs['from']) -To ([string]$qs['to']))
+}
+
 function Invoke-Route {
     param($Ctx, [string]$Rid)
     $req = $Ctx.Request
@@ -2161,18 +3514,74 @@ function Invoke-Route {
     $path = $req.Url.AbsolutePath
     if (-not $req.IsLocal) { return (New-ErrorResult 403 'forbidden' 'Requests are accepted from this computer only.') }
     if ($method -eq 'GET' -and $path -eq '/') {
-        $html = $script:PageHtml.Replace('__TOKEN__', $script:Token).Replace('__VERSION__', $script:Version)
+        # Behind the proxy the page holds no key before the login: the key of a session comes with GET /api/v1/session.
+        $pageKey = ''
+        if (-not $script:BehindProxy) { $pageKey = [string]$script:Token }
+        $html = $script:PageHtml.Replace('__TOKEN__', $pageKey).Replace('__VERSION__', $script:Version)
         return @{ Status = 200; Bytes = [System.Text.Encoding]::UTF8.GetBytes($html); ContentType = 'text/html; charset=utf-8'
-            Headers = @{ 'Content-Security-Policy' = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; img-src data:; base-uri 'none'; form-action 'none'" } }
+            Headers = @{ 'Content-Security-Policy' = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; img-src data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'" } }
     }
     if ($method -eq 'GET' -and $path -eq '/health') {
         return @{ Status = 200; Json = @{ status = 'ok'; version = $script:Version } }
     }
     if (-not $path.StartsWith('/api/v1/')) { return (New-ErrorResult 404 'not_found' 'Not found.') }
-    $tok = $req.Headers['X-Console-Token']
-    if (-not $tok -or $tok -cne $script:Token) { return (New-ErrorResult 403 'forbidden' 'Missing or wrong X-Console-Token.') }
+
     $origin = $req.Headers['Origin']
-    if ($origin -and $origin -cne ('http://localhost:' + $script:Port)) { return (New-ErrorResult 403 'forbidden' 'Origin not allowed.') }
+    $allowedOrigin = 'http://localhost:' + $script:Port
+    if ($script:BehindProxy) { $allowedOrigin = [string]$script:PublicOrigin }
+    if (-not (Test-OriginAllowed -Origin $origin -Allowed $allowedOrigin)) { return (New-ErrorResult 403 'forbidden' 'Origin not allowed.') }
+
+    # Session: the cookie finds it; the session's own credential and page key are used from here on.
+    $cookieId = Get-CookieValue -Header ([string]$req.Headers['Cookie']) -Name 'dk_session'
+    $route = $method + ' ' + $path.ToLowerInvariant()
+    $found = Find-Session -Id $cookieId -NoTouch:($route -eq 'get /api/v1/doors/states')
+    $script:Sess = $found.Session
+    if ($null -ne $script:Sess) {
+        $script:Cred = $script:Sess.Cred
+        if ($script:BehindProxy -and $null -ne $script:RequestClient) { $script:Sess.ClientIp = [string]$script:RequestClient.Ip }
+    }
+    $open = ($route -eq 'get /api/v1/session' -or $route -eq 'post /api/v1/login')
+    if ($cookieId -and $null -eq $script:Sess -and -not $open) {
+        # A cookie whose session is gone (idle time-out, 12 h limit, restart): say so and clear the cookie.
+        $why = 'Your session ended. Log in again.'
+        if ($found.Expired -eq 'idle') { $why = 'Your session ended after ' + (Get-IdleMinutes) + ' minutes without use. Log in again.' }
+        $r = New-ErrorResult 401 'session_expired' $why
+        $r.Headers = @{ 'Set-Cookie' = (New-SessionCookieHeader -Id '' -Secure ([bool]$script:BehindProxy) -Clear $true) }
+        return $r
+    }
+    if ($script:BehindProxy -and $null -eq $script:Sess -and -not $open) { return (New-ErrorResult 401 'not_logged_in' 'Log in with the AEOS user first.') }
+    if ($route -ne 'get /api/v1/session' -and -not ($script:BehindProxy -and $route -eq 'post /api/v1/login')) {
+        $expectedKey = ''
+        if ($null -ne $script:Sess) { $expectedKey = [string]$script:Sess.Csrf }
+        elseif (-not $script:BehindProxy) { $expectedKey = [string]$script:Token }
+        if (-not (Test-CsrfToken -Expected $expectedKey -Supplied ([string]$req.Headers['X-Console-Token']))) { return (New-ErrorResult 403 'forbidden' 'Missing or wrong X-Console-Token.') }
+    }
+
+    if (Test-AdminOnlyRoute -Method $method -Path $path) { Assert-Admin }
+
+    if ($method -eq 'PUT' -and $path -eq '/api/v1/aliases') {
+        $in = Read-RequestJson $req
+        if ($null -eq $in -or $null -eq $in.PSObject.Properties['aliases'] -or $in.aliases -isnot [System.Management.Automation.PSCustomObject]) { throw (New-ApiException 400 'bad_request' 'Send {"aliases": {"<door id>": "<alias>"}}.') }
+        $upd = [ordered]@{}
+        foreach ($p in $in.aliases.PSObject.Properties) { $upd[$p.Name] = $p.Value }
+        if ($upd.Count -gt 20000) { throw (New-ApiException 413 'too_large' 'More than 20000 aliases in one request.') }
+        foreach ($k in @($upd.Keys)) { if ($upd[$k] -isnot [string]) { throw (New-ApiException 400 'invalid_alias' ('aliases["' + $k + '"] must be text.')) } }
+        Set-DoorAliases -Updates $upd
+        Write-DebugLog $Rid ('Aliases saved: ' + $upd.Count + ' entr(ies) changed.')
+        return @{ Status = 200; Json = @{ ok = $true; changed = $upd.Count } }
+    }
+    if ($method -eq 'PUT' -and $path.StartsWith('/api/v1/aliases/')) {
+        $raw = $req.RawUrl
+        $qi = $raw.IndexOf('?')
+        if ($qi -ge 0) { $raw = $raw.Substring(0, $qi) }
+        $id = ''
+        try { $id = [Uri]::UnescapeDataString($raw.Substring('/api/v1/aliases/'.Length)) } catch { $id = '' }
+        $in = Read-RequestJson $req
+        if (-not $id -or $null -eq $in -or $null -eq $in.PSObject.Properties['alias'] -or $in.alias -isnot [string]) { throw (New-ApiException 400 'bad_request' 'Send {"alias": "<text>"} to /api/v1/aliases/<door id>.') }
+        Set-DoorAliases -Updates ([ordered]@{ $id = $in.alias })
+        Write-DebugLog $Rid ('Alias of door ' + $id + ' saved.')
+        return @{ Status = 200; Json = @{ ok = $true; id = $id; alias = ([string]$in.alias).Trim() } }
+    }
 
     switch ($method + ' ' + $path) {
         'GET /api/v1/config' {
@@ -2184,8 +3593,25 @@ function Invoke-Route {
             $merged = Merge-Config (ConvertFrom-Json -InputObject (Get-DefaultConfigJson)) $in
             $problems = @(Test-ConfigObject $merged)
             if ($problems.Count -gt 0) { throw (New-ApiException 400 'invalid_config' ($problems -join ' ')) }
+            $adminErr = Test-AdminListChange -Old @(Get-AdminList) -New @($merged.access.admins) -User (Get-CurrentUserName)
+            if ($adminErr) { throw (New-ApiException 400 'admin_list' $adminErr) }
+            # The audit file may not change while a batch job is appending to it.
+            $newAuditPath = Resolve-DataPath -Value ([string]$merged.auditFile) -BaseDir $script:ScriptDir -DefaultName 'doorkeeper-audit.jsonl'
+            if ($newAuditPath -ne $script:AuditPath) {
+                foreach ($aj in @($script:Jobs.Values)) { if (Test-JobActive -Job $aj) { throw (New-ApiException 409 'job_running' 'A batch job is running: the audit file cannot be changed until it has finished.') } }
+            }
+            $targetChanges = @(Get-AeosTargetChanges -Old $script:Config -New $merged)
             Save-ConfigFile -Config $merged -Path $script:ConfigPath
             $script:Config = $merged
+            # The server password may only be used against the address and TLS setting it was entered for.
+            if ($targetChanges.Count -gt 0 -and ($null -ne $script:ServerAccount -and $script:ServerAccount.present -or ($null -ne $script:Shared -and $null -ne $script:Shared.Account))) {
+                Remove-ServerAccountFiles -BlobPath $script:ServerAccountPath -MetaPath $script:ServerAccountMetaPath
+                $script:ServerAccount = Read-ServerAccount -BlobPath $script:ServerAccountPath -MetaPath $script:ServerAccountMetaPath
+                Set-PollerAccount -Cred $null
+                Write-AuditRecord -Action 'server-account-remove' -DoorId '' -DoorName ($targetChanges -join ',') -HttpStatus 0 -Ok $true -Fault 'AEOS address or TLS setting changed'
+                Write-DebugLog $Rid ('Server account removed: AEOS address or TLS setting changed (' + ($targetChanges -join ', ') + ').')
+            }
+            if ($null -ne $script:Shared) { $script:Shared.Config = $merged; $script:Shared.RelistDoors = $true; $script:Shared.Wake = $true }
             Initialize-Paths
             Write-DebugLog $Rid ('Config saved to ' + $script:ConfigPath + "`r`n" + (ConvertTo-Json -InputObject $script:Config -Depth 10))
             return @{ Status = 200; Json = @{ ok = $true } }
@@ -2196,22 +3622,140 @@ function Invoke-Route {
             $p = ''
             if ($null -ne $in) { $u = [string]$in.user; $p = [string]$in.password }
             if (-not $u -or -not $p) { throw (New-ApiException 400 'bad_login' 'User and password are required.') }
+            if ($u.Length -gt 200) { throw (New-ApiException 400 'bad_login' 'The user name is too long.') }
+            $clientIp = [string]$script:RequestClient.Ip
+            # 5 failed logins in 5 minutes block that user + client address pair for 5 minutes (audited).
+            $lkey = Get-LoginKey -User $u -ClientIp $clientIp
+            if ($null -eq $script:LoginAttempts) { $script:LoginAttempts = @{} }
+            $entry = $script:LoginAttempts[$lkey]
+            $wait = Get-LoginBlockSeconds -Entry $entry -Now ([DateTime]::UtcNow)
+            if ($wait -gt 0) {
+                Write-AuditRecord -Action 'login-blocked' -DoorId '' -DoorName '' -HttpStatus 429 -Ok $false -Fault ('Too many failed logins; blocked for ' + $wait + ' more seconds.') -AeosUser $u
+                Write-DebugLog $Rid ('Login blocked: user=' + $u + ' from ' + $clientIp + ' for ' + $wait + ' s')
+                throw (New-ApiException 429 'login_blocked' ('Too many failed logins for this user from this address. Try again in ' + $wait + ' seconds.'))
+            }
             $ss = New-Object System.Security.SecureString
             foreach ($ch in $p.ToCharArray()) { $ss.AppendChar($ch) }
             $ss.MakeReadOnly()
-            $script:Cred = New-Object System.Management.Automation.PSCredential($u, $ss)
+            # The password is checked against AEOS first; a refused login keeps nothing and is audited.
+            $prevCred = $script:Cred
+            $newCred = New-Object System.Management.Automation.PSCredential($u, $ss)
+            $script:Cred = $newCred
+            $chk = $null
+            $caught = $null
+            try { $chk = Test-AeosLogin -Rid $Rid }
+            catch { $caught = $_.Exception }
+            $why = ''
+            if ($null -ne $caught) { $why = $caught.Message }
+            elseif (-not $chk.ok) { $why = [string]$chk.reason }
+            $why = Protect-Text -Text $why
+            if ($why) {
+                $script:Cred = $prevCred
+                $blockNow = $false
+                if ($null -eq $caught -and $chk.refused) {
+                    if ($null -eq $entry) { $entry = New-LoginAttemptEntry; $script:LoginAttempts[$lkey] = $entry }
+                    $blockNow = Register-LoginFailure -Entry $entry -Now ([DateTime]::UtcNow)
+                }
+                $auditWhy = $why
+                if ($blockNow) { $auditWhy = $why + ' (5 failed logins in 5 minutes: this user from this address is blocked for 5 minutes)' }
+                Write-AuditRecord -Action 'login' -DoorId '' -DoorName '' -HttpStatus 0 -Ok $false -Fault $auditWhy -AeosUser $u
+                Write-DebugLog $Rid ('Login refused: user=' + $u + ' - ' + $auditWhy)
+                if ($null -ne $caught) { throw $caught }
+                if ($chk.notConfigured) { throw (New-ApiException 503 'not_configured' ([string]$chk.reason)) }
+                if ($chk.refused) { throw (New-ApiException 401 'login_refused' 'AEOS refused the user or password.') }
+                throw (New-ApiException 502 'login_check_failed' ('The login could not be checked: ' + $why))
+            }
+            if ($script:LoginAttempts.ContainsKey($lkey)) { $script:LoginAttempts.Remove($lkey) }
+            # A new login replaces the session of this browser (if any); the old credential is dropped.
+            if ($null -ne $script:Sess) { $script:Sessions.Remove([string]$script:Sess.Id) }
+            $sess = New-SessionRecord -Cred $newCred -ClientIp $clientIp -WindowsUser ([string]$script:RequestClient.WindowsUser)
+            $script:Sessions[$sess.Id] = $sess
+            $script:Sess = $sess
+            $script:Cred = $newCred
+            Write-AuditRecord -Action 'login' -DoorId '' -DoorName '' -HttpStatus 0 -Ok $true -Fault $null
             Write-DebugLog $Rid ('Login: user=' + $u)
-            return @{ Status = 200; Json = @{ loggedIn = $true; user = $u } }
+            return @{ Status = 200; Json = (Get-SessionInfo); Headers = @{ 'Set-Cookie' = (New-SessionCookieHeader -Id $sess.Id -Secure ([bool]$script:BehindProxy)) } }
         }
         'POST /api/v1/logout' {
             Write-DebugLog $Rid 'Logout'
+            if ($null -ne $script:Cred) { Write-AuditRecord -Action 'logout' -DoorId '' -DoorName '' -HttpStatus 0 -Ok $true -Fault $null }
+            if ($null -ne $script:Sess) { $script:Sessions.Remove([string]$script:Sess.Id) }
+            $script:Sess = $null
             $script:Cred = $null
-            return @{ Status = 200; Json = @{ loggedIn = $false; user = '' } }
+            return @{ Status = 200; Json = (Get-SessionInfo); Headers = @{ 'Set-Cookie' = (New-SessionCookieHeader -Id '' -Secure ([bool]$script:BehindProxy) -Clear $true) } }
         }
         'GET /api/v1/session' {
+            $info = Get-SessionInfo
+            if ($null -ne $found -and $found.Expired) { $info.expired = [string]$found.Expired }
+            return @{ Status = 200; Json = $info }
+        }
+        'GET /api/v1/server-account' {
+            return @{ Status = 200; Json = (Get-ServerAccountStatus) }
+        }
+        'PUT /api/v1/server-account' {
+            $in = Read-RequestJson $req
             $u = ''
-            if ($null -ne $script:Cred) { $u = $script:Cred.UserName }
-            return @{ Status = 200; Json = @{ loggedIn = ($null -ne $script:Cred); user = $u } }
+            $p = ''
+            if ($null -ne $in) { $u = [string]$in.user; $p = [string]$in.password }
+            if (-not $u.Trim() -or -not $p) { throw (New-ApiException 400 'bad_request' 'The server account needs a user name and a password.') }
+            $u = $u.Trim()
+            if ($u.Length -gt 200 -or $u -match '[\x00-\x1F\x7F]') { throw (New-ApiException 400 'bad_request' 'The user name is too long or has a control character.') }
+            $ss = New-Object System.Security.SecureString
+            foreach ($ch in $p.ToCharArray()) { $ss.AppendChar($ch) }
+            $ss.MakeReadOnly()
+            $acct = New-Object System.Management.Automation.PSCredential($u, $ss)
+            # AEOS must accept the account before it is kept (the admin's own credential is put back afterwards).
+            $adminCred = $script:Cred
+            $script:Cred = $acct
+            $chk = $null
+            $caught = $null
+            try { $chk = Test-AeosLogin -Rid $Rid }
+            catch { $caught = $_.Exception; $caughtText = Protect-Text -Text $_.Exception.Message }
+            finally { $script:Cred = $adminCred }
+            if ($null -ne $caught) { throw (New-ApiException 502 'login_check_failed' ('The server account could not be checked: ' + $caughtText)) }
+            if (-not $chk.ok) {
+                if ($chk.notConfigured) { throw (New-ApiException 503 'not_configured' ([string]$chk.reason)) }
+                if ($chk.refused) { throw (New-ApiException 401 'login_refused' 'AEOS refused the server account user or password. It was not saved.') }
+                throw (New-ApiException 502 'login_check_failed' ('The server account could not be checked: ' + [string]$chk.reason))
+            }
+            try { $saved = Save-ServerAccount -Cred $acct -SetBy (Get-CurrentUserName) -BlobPath $script:ServerAccountPath -MetaPath $script:ServerAccountMetaPath }
+            catch { throw (New-ApiException 500 'store_failed' ('The server account could not be stored: ' + $_.Exception.Message + ' (behind IIS the app pool needs loadUserProfile=true).')) }
+            if ($saved.aclError) { Write-DebugLog $Rid ('Server account file ACL not set: ' + $saved.aclError) 'WARN' }
+            $script:ServerAccount = Read-ServerAccount -BlobPath $script:ServerAccountPath -MetaPath $script:ServerAccountMetaPath
+            Write-AuditRecord -Action 'server-account-set' -DoorId '' -DoorName $u -HttpStatus 0 -Ok $true -Fault $null
+            Write-DebugLog $Rid ('Server account set by ' + (Get-CurrentUserName) + ' (user ' + $u + ').')
+            Set-PollerAccount -Cred $acct
+            Start-StatePoller
+            return @{ Status = 200; Json = (Get-ServerAccountStatus) }
+        }
+        'DELETE /api/v1/server-account' {
+            Remove-ServerAccountFiles -BlobPath $script:ServerAccountPath -MetaPath $script:ServerAccountMetaPath
+            $script:ServerAccount = Read-ServerAccount -BlobPath $script:ServerAccountPath -MetaPath $script:ServerAccountMetaPath
+            Set-PollerAccount -Cred $null
+            Write-AuditRecord -Action 'server-account-remove' -DoorId '' -DoorName '' -HttpStatus 0 -Ok $true -Fault $null
+            Write-DebugLog $Rid ('Server account removed by ' + (Get-CurrentUserName) + '.')
+            return @{ Status = 200; Json = (Get-ServerAccountStatus) }
+        }
+        'GET /api/v1/doors/states' {
+            $since = 0
+            $q = $req.QueryString['since']
+            if ($q -and -not [int]::TryParse($q, [ref]$since)) { throw (New-ApiException 400 'bad_request' 'since must be a whole number.') }
+            $ps = Get-PollSettings
+            $ans = Get-StateAnswer -Since $since -Allowed $(if ($null -ne $script:Sess) { $script:Sess.DoorIds } else { $null })
+            return @{ Status = 200; Json = @{ ver = $ans.ver; live = (Test-LiveStates); account = (Test-ServerAccountSet); freshSeconds = $ps.freshSeconds; pollSeconds = $ps.pollSeconds; states = $ans.states } }
+        }        'GET /api/v1/me/settings' {
+            if ($null -eq $script:Cred) { throw (New-ApiException 401 'not_logged_in' 'Log in with the AEOS user first.') }
+            return @{ Status = 200; Json = @{ user = (Get-CurrentUserName); settings = (Get-UserSettings -User (Get-CurrentUserName)) } }
+        }
+        'PUT /api/v1/me/settings' {
+            if ($null -eq $script:Cred) { throw (New-ApiException 401 'not_logged_in' 'Log in with the AEOS user first.') }
+            $text = Read-RequestText $req 4096
+            $in = $null
+            try { $in = ConvertFrom-Json -InputObject $text } catch { throw (New-ApiException 400 'bad_json' 'The request body is not valid JSON.') }
+            $cv = ConvertTo-UserSettings -In $in
+            if (-not $cv.ok) { throw (New-ApiException 400 'bad_settings' $cv.error) }
+            Set-UserSettings -User (Get-CurrentUserName) -Value $cv.value
+            return @{ Status = 200; Json = @{ ok = $true; settings = $cv.value } }
         }
         'GET /api/v1/wsdl' {
             $info = Get-WsdlInfoFromServer -Rid $Rid
@@ -2241,24 +3785,64 @@ function Invoke-Route {
             return @{ Status = 200; Json = @{ httpStatus = $r.httpStatus; ok = $r.ok; fault = $r.fault; response = $r.response } }
         }
         'GET /api/v1/doors' {
-            return @{ Status = 200; Json = (Get-DoorsFromServer -Rid $Rid) }
+            $dl = Get-DoorsFromServer -Rid $Rid
+            $ps = Get-PollSettings
+            $dl.live = (Test-LiveStates)
+            $dl.account = (Test-ServerAccountSet)
+            # the doors this session may see (its own listing) - the states and the door routes are limited to them
+            if ($null -ne $script:Sess -and $dl.ok) {
+                $idset = @{}
+                foreach ($dd0 in @($dl.doors)) { $idset[[string]$dd0.id] = $true }
+                $script:Sess.DoorIds = $idset
+            }
+            $dl.freshSeconds = $ps.freshSeconds
+            $dl.ver = (Get-StateVersion)
+            return @{ Status = 200; Json = $dl }
         }
         'POST /api/v1/doors/action' {
             Assert-Licensed
             $in = Read-RequestJson $req
             if ($null -eq $in) { throw (New-ApiException 400 'bad_request' 'Empty request body.') }
-            return @{ Status = 200; Json = (Invoke-DoorAction -Rid $Rid -Action ([string]$in.action) -Id ([string]$in.id) -Name ([string]$in.name) -Extra $in.extra) }
+            # Only the id of the client counts: name and extra come from the server's own door list (also for the audit line).
+            $dd = @(Resolve-ServerDoors -Requested @([string]$in.id) -Map $script:Shared.DoorMap -Allowed $(if ($null -ne $script:Sess) { $script:Sess.DoorIds } else { $null }))
+            return @{ Status = 200; Json = (Invoke-DoorAction -Rid $Rid -Action ([string]$in.action) -Id ([string]$dd[0].id) -Name ([string]$dd[0].name) -Extra $dd[0].extra) }
         }
         'POST /api/v1/doors/state' {
             $in = Read-RequestJson $req
             if ($null -eq $in -or $null -eq $in.doors) { throw (New-ApiException 400 'bad_request' 'A list of doors is required.') }
-            return @{ Status = 200; Json = (Get-DoorStates -Rid $Rid -Doors @($in.doors)) }
+            # one id once; at most "Doors per socket session" in one request (a bigger read belongs to the poller / chunks)
+            $seenIds = @{}
+            $idList = @()
+            foreach ($rq in @($in.doors)) {
+                if ($null -eq $rq) { continue }
+                $rid0 = ''
+                if ($rq -is [string]) { $rid0 = $rq } elseif ($null -ne $rq.PSObject.Properties['id']) { $rid0 = [string]$rq.id }
+                if ($rid0 -and -not $seenIds.ContainsKey($rid0)) { $seenIds[$rid0] = $true; $idList += $rid0 }
+            }
+            if ($idList.Count -gt (Get-MaxDoorsPerRefresh)) { throw (New-ApiException 400 'too_many' ('At most ' + (Get-MaxDoorsPerRefresh) + ' doors in one state request.')) }
+            $dd = @(Resolve-ServerDoors -Requested $idList -Map $script:Shared.DoorMap -Allowed $(if ($null -ne $script:Sess) { $script:Sess.DoorIds } else { $null }))
+            if (Test-LiveStates) {
+                # live: answer from the cache and let the poller re-read these doors; the request loop never waits for AEOS here
+                foreach ($qd in $dd) { if ($script:Shared.Priority.Count -lt 5000) { $script:Shared.Priority.Enqueue([string]$qd.id) } }
+                return @{ Status = 200; Json = @{ states = @(Get-CachedStates -Ids $idList); cached = $true } }
+            }
+            return @{ Status = 200; Json = (Get-DoorStates -Rid $Rid -Doors $dd) }
         }
         'POST /api/v1/doors/batch' {
             Assert-Licensed
             $in = Read-RequestJson $req
             if ($null -eq $in -or $null -eq $in.doors) { throw (New-ApiException 400 'bad_request' 'An action and a list of doors are required.') }
-            return @{ Status = 200; Json = (Invoke-DoorBatch -Rid $Rid -Action ([string]$in.action) -Doors @($in.doors) -Report $in.report) }
+            # The batch runs as a background job with the operator's own credential; the page follows GET /api/v1/jobs/<id>.
+            Assert-BatchAllowed -Action ([string]$in.action) -Doors @($in.doors)
+            $me = Get-CurrentUserName
+            $busy = Find-ActiveJobOfUser -Jobs $script:Jobs -User $me
+            if ($null -ne $busy) { throw (New-ApiException 409 'job_running' 'You already have a job running. Wait until it has finished.') }
+            $doorList = @(Resolve-ServerDoors -Requested @($in.doors) -Map $script:Shared.DoorMap -Allowed $(if ($null -ne $script:Sess) { $script:Sess.DoorIds } else { $null }))
+            $job = New-JobRecord -Id $Rid -User $me -Action ([string]$in.action) -Total $doorList.Count
+            $script:Jobs[$Rid] = $job
+            Start-BatchJob -Job $job -Doors $doorList -Report $in.report -Cred $script:Cred -Client @{ Ip = [string]$script:RequestClient.Ip; WindowsUser = $script:RequestClient.WindowsUser }
+            Write-DebugLog $Rid ('Batch job started: ' + [string]$in.action + ' on ' + $doorList.Count + ' door(s) for ' + $me)
+            return @{ Status = 202; Json = @{ jobId = $Rid; state = 'queued'; total = $doorList.Count; action = [string]$in.action } }
         }
         'POST /api/v1/socket' {
             Assert-Licensed
@@ -2273,8 +3857,16 @@ function Invoke-Route {
             if ($q -and [int]::TryParse($q, [ref]$tmp) -and $tmp -gt 0 -and $tmp -le 1000) { $limit = $tmp }
             $recs = @(Read-AuditRecords)
             $chain = Test-AuditChain $recs
-            $last = @($recs | Select-Object -Last $limit)
-            return @{ Status = 200; Json = @{ records = $last; chainOk = $chain.ChainOk; badIndex = $chain.BadIndex; total = $recs.Count } }
+            $sel = @(Get-AuditSelection -Request $req -Records $recs)
+            $last = @($sel | Select-Object -Last $limit)
+            return @{ Status = 200; Json = @{ records = $last; chainOk = $chain.ChainOk; badIndex = $chain.BadIndex; total = $recs.Count; matched = $sel.Count } }
+        }
+        'GET /api/v1/audit/export' {
+            $recs = @(Read-AuditRecords)
+            $sel = @(Get-AuditSelection -Request $req -Records $recs)
+            $name = 'doorkeeper-audit-' + [DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss') + '.csv'
+            return @{ Status = 200; Bytes = (New-Object System.Text.UTF8Encoding($false)).GetBytes((ConvertTo-AuditCsv -Records $sel)); ContentType = 'text/csv; charset=utf-8'
+                Headers = @{ 'Content-Disposition' = 'attachment; filename="' + $name + '"' } }
         }
         'GET /api/v1/debuglog' {
             $n = 200
@@ -2292,7 +3884,13 @@ function Invoke-Route {
         }
         'GET /api/v1/arming/report' {
             $f = [string]$req.QueryString['file']
-            if ($f -notmatch '^doorkeeper-arming-\d{8}-\d{6}(-\d+)?\.csv$') { throw (New-ApiException 400 'bad_request' 'Bad file name.') }
+            if ($f -notmatch '^doorkeeper-arming-\d{8}-\d{6}(-[0-9a-f]{8})?(-\d+)?\.csv$') { throw (New-ApiException 400 'bad_request' 'Bad file name.') }
+            # Owner or admin only (like a job); a report with no remembered owner (older file, restart) is for admins.
+            $meR = Get-CurrentUserName
+            $ownerR = ''
+            if ($null -ne $script:Shared -and $null -ne $script:Shared.ReportOwners -and $script:Shared.ReportOwners.ContainsKey($f)) { $ownerR = [string]$script:Shared.ReportOwners[$f] }
+            $isOwnerR = ($ownerR -and [string]::Equals($ownerR, $meR, [System.StringComparison]::OrdinalIgnoreCase))
+            if (-not $isOwnerR -and (Get-UserRole -Admins @(Get-AdminList) -User $meR -BehindProxy:([bool]$script:BehindProxy)) -ne 'admin') { throw (New-ApiException 403 'forbidden_role' 'This report belongs to another operator.') }
             $p = Join-Path (Split-Path -Parent $script:AuditPath) $f
             if (-not (Test-Path -LiteralPath $p)) { throw (New-ApiException 404 'not_found' 'No such arming report.') }
             return @{ Status = 200; Bytes = [System.IO.File]::ReadAllBytes($p); ContentType = 'text/csv; charset=utf-8'
@@ -2311,7 +3909,18 @@ function Invoke-Route {
             return @{ Status = 200; Bytes = [System.IO.File]::ReadAllBytes($p); ContentType = 'application/zip'
                 Headers = @{ 'Content-Disposition' = 'attachment; filename="' + $f + '"' } }
         }
-        default { return (New-ErrorResult 404 'not_found' 'Unknown API path or method.') }
+        default {
+            if ($method -eq 'GET' -and $path.StartsWith('/api/v1/jobs/')) {
+                $jid = $path.Substring('/api/v1/jobs/'.Length)
+                if ($jid -notmatch '^[0-9a-f]{8}$' -or -not $script:Jobs.ContainsKey($jid)) { throw (New-ApiException 404 'not_found' 'No such job.') }
+                $job = $script:Jobs[$jid]
+                $me = Get-CurrentUserName
+                $isMine = [string]::Equals([string]$job.User, $me, [System.StringComparison]::OrdinalIgnoreCase)
+                if (-not $isMine -and (Get-UserRole -Admins @(Get-AdminList) -User $me -BehindProxy:([bool]$script:BehindProxy)) -ne 'admin') { throw (New-ApiException 403 'forbidden_role' 'This job belongs to another operator.') }
+                return @{ Status = 200; Json = (Get-JobPublic -Job $job) }
+            }
+            return (New-ErrorResult 404 'not_found' 'Unknown API path or method.')
+        }
     }
 }
 
@@ -2323,6 +3932,11 @@ function Send-Result {
     $resp.Headers.Add('Cache-Control', 'no-store')
     $resp.Headers.Add('X-Content-Type-Options', 'nosniff')
     $resp.Headers.Add('X-Frame-Options', 'DENY')
+    $resp.Headers.Add('Referrer-Policy', 'no-referrer')
+    $own = @{}
+    if ($Result.ContainsKey('Headers')) { foreach ($k in $Result.Headers.Keys) { $own[([string]$k).ToLowerInvariant()] = $true } }
+    # Content-Security-Policy on every answer: the page sets its own (self only); everything else may load nothing.
+    if (-not $own.ContainsKey('content-security-policy')) { $resp.Headers.Add('Content-Security-Policy', "default-src 'none'; frame-ancestors 'none'") }
     if ($Result.ContainsKey('Headers')) {
         foreach ($k in $Result.Headers.Keys) { $resp.Headers.Add($k, [string]$Result.Headers[$k]) }
     }
@@ -2348,9 +3962,18 @@ function Invoke-Request {
     $rid = New-RequestId
     $method = $Ctx.Request.HttpMethod
     $path = $Ctx.Request.Url.AbsolutePath
-    $quiet = ($method -eq 'GET' -and $path -eq '/api/v1/debuglog')
+    $quiet = (($method -eq 'GET' -and $path -eq '/api/v1/debuglog') -or ($method -eq 'GET' -and $path -eq '/api/v1/doors/states'))
     $result = $null
     $errNote = ''
+    # The request context: who asked (session credential, client address, Windows user from IIS). Cleared at the end.
+    $script:Cred = $null
+    $script:Sess = $null
+    $remote = ''
+    try { $remote = $Ctx.Request.RemoteEndPoint.Address.ToString() } catch { }
+    # Behind IIS the Windows user is not available (LOGON_USER is empty at the URL Rewrite stage, lab-proven): windowsUser stays empty.
+    $winUser = $null
+    if ($script:BehindProxy) { $winUser = '' }
+    $script:RequestClient = @{ Ip = (Get-ForwardedClientIp -RemoteAddr $remote -ForwardedFor ([string]$Ctx.Request.Headers['X-DK-Client-IP']) -BehindProxy ([bool]$script:BehindProxy)); WindowsUser = $winUser }
     try { $result = Invoke-Route -Ctx $Ctx -Rid $rid }
     catch {
         $e = $_.Exception
@@ -2368,9 +3991,13 @@ function Invoke-Request {
     if (-not $errNote -and $result.Status -ge 400 -and $result.Json -and $result.Json.error) {
         $errNote = ' error=' + $result.Json.error.code + ': ' + $result.Json.error.message
     }
+    $script:Cred = $null
+    $script:Sess = $null
+    $script:RequestClient = $null
     try { Send-Result -Ctx $Ctx -Result $result -Rid $rid }
     catch { Write-DebugLog $rid ('Sending the response failed: ' + $_.Exception.Message) 'ERROR' }
     $sw.Stop()
+    try { Save-StateCache } catch { }
     if (-not $quiet -or $result.Status -ge 400) {
         Write-DebugLog $rid ('API ' + $method + ' ' + $path + ' -> ' + $result.Status + ' (' + $sw.ElapsedMilliseconds + ' ms)' + $errNote)
     }
@@ -2435,7 +4062,17 @@ nav button.active{border-bottom-color:var(--blue-deep);color:var(--ink);font-wei
 table{border-collapse:collapse;width:100%}
 th,td{border-bottom:1px solid #ECEEF2;padding:10px 8px;text-align:left;vertical-align:middle}
 th{background:#F7F8FA;color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.04em;font-weight:600;border-bottom:1px solid var(--line)}
-#doors-body td:nth-child(2){font-weight:600;color:var(--ink)}
+#doors-body td.dname{font-weight:600;color:var(--ink)}
+nav button.admin-tab{display:none}
+body.role-admin nav button.admin-tab{display:inline-block}
+th.sortable{cursor:pointer;user-select:none;white-space:nowrap}
+th.sortable:hover{color:var(--ink)}
+td.alias{min-width:110px}
+td.alias.editable{cursor:text}
+td.alias.editable:hover{outline:1px dashed var(--field);outline-offset:-2px}
+input.alias-edit{width:100%;min-width:120px;height:30px}
+.schip.last{opacity:.55;font-weight:600}
+.aud-filter{display:flex;flex-wrap:wrap;align-items:flex-end;gap:8px;margin:8px 0}
 tr.picked{background:#F3F7FF}
 button{font:inherit;cursor:pointer;height:36px;padding:0 14px;background:#fff;color:var(--ink);border:1px solid var(--field);border-radius:6px}
 button:hover{filter:brightness(.96)}
@@ -2555,10 +4192,10 @@ button.arm-btn{height:26px;padding:0 8px;font-size:12px}
 </header>
 <nav>
   <button class="tab active" data-tab="doors">Doors</button>
-  <button class="tab" data-tab="setup">Setup</button>
-  <button class="tab" data-tab="raw">Raw call</button>
-  <button class="tab" data-tab="audit">Audit</button>
-  <button class="tab" data-tab="debug">Debug</button>
+  <button class="tab admin-tab" data-tab="setup">Setup</button>
+  <button class="tab admin-tab" data-tab="raw">Raw call</button>
+  <button class="tab admin-tab" data-tab="audit">Audit</button>
+  <button class="tab admin-tab" data-tab="debug">Debug</button>
 </nav>
 
 <div class="panel active" id="tab-doors">
@@ -2569,6 +4206,7 @@ button.arm-btn{height:26px;padding:0 8px;font-size:12px}
     <span id="door-counts"></span>
   </div>
   <div class="msg" id="doors-msg"></div>
+  <div id="job-bar" style="display:none"><span id="job-text"></span> <progress id="job-progress" value="0" max="1"></progress></div>
   <div id="batch-bar" style="display:none"><b id="batch-count">0 selected</b> <span id="batch-buttons"></span> <span id="arm-buttons"><button id="btn-arm" class="arm-btn sel-arm" data-kind="arm" type="button">Arm selected</button> <button id="btn-disarm" class="arm-btn sel-arm" data-kind="disarm" type="button">Disarm selected</button></span> <button id="btn-lockdown" class="lockdown"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="11" width="18" height="11" rx="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg>Lockdown</button></div>
   <div id="arm-report" style="display:none">
     <h3 id="arm-report-title"></h3>
@@ -2606,6 +4244,7 @@ button.arm-btn{height:26px;padding:0 8px;font-size:12px}
     <div class="msg" id="lic-msg"></div>
   </fieldset>
   <fieldset><legend>Connection</legend>
+    <p class="hint" id="target-hint">Changing the AEOS address or TLS setting removes the server account; enter it again afterwards.</p>
     <label><span>AEOS URL</span><input type="text" id="cfg-aeosUrl" size="46"></label>
     <label><span>WSDL URL (empty = AEOS URL + ?wsdl)</span><input type="text" id="cfg-wsdlUrl" size="46"></label><br>
     <label><span>SOAP version</span><select id="cfg-soapVersion"><option>1.1</option><option>1.2</option></select></label>
@@ -2627,8 +4266,31 @@ button.arm-btn{height:26px;padding:0 8px;font-size:12px}
     <label><input type="checkbox" id="sk-tls"> Use TLS</label>
     <label><input type="checkbox" id="sk-tlsSkipValidation"> Skip TLS certificate validation (self-signed server; shows a warning)</label><br>
     <label><span>Login command ({{user}} {{password}} = the user and password typed at the top of the page)</span><input type="text" id="sk-loginTemplate" size="50"></label>
-    <label><span>Login success pattern (regex on the reply line; empty = any reply)</span><input type="text" id="sk-loginSuccessPattern" size="30"></label>
+    <label><span>Login success pattern (regex on the reply line)</span><input type="text" id="sk-loginSuccessPattern" size="30"></label> <span id="sk-pattern-warn" class="warn" style="display:none">Empty = the login is not checked over the socket.</span>
     <label style="display:block"><span>Init commands (one per line, each sent after the login; one reply line is read for each)</span><textarea id="sk-initCommands" style="min-height:44px"></textarea></label>
+  </fieldset>
+  <fieldset id="fs-access"><legend>Admins</legend>
+    <p class="hint">AEOS user names (one per line, upper or lower case) that may use the Setup, Raw call, Audit and Debug tabs. Every other user is an operator and sees the Doors tab only. While this list is empty, every user is an admin. Your own name must stay in the list.</p>
+    <label style="display:block"><span>Admins (AEOS user names, one per line)</span><textarea id="cfg-admins" style="min-height:60px"></textarea></label>
+  </fieldset>
+  <fieldset id="fs-server"><legend>Live door states (server account)</legend>
+    <p class="hint">The console reads all door states in the background with its own AEOS account, so every operator sees them live without pressing Load. The account only reads: every door action runs with the operator's own AEOS account. Use a dedicated AEOS user with the fewest rights that allow login and the state queries. The password is stored encrypted for the Windows account that runs DoorKeeper and is never shown again.</p>
+    <div id="sa-status" class="hint">Status unknown.</div>
+    <label><span>Server account (AEOS user)</span><input type="text" id="sa-user" size="24" autocomplete="off"></label>
+    <label><span>Password</span><input type="password" id="sa-password" size="24" autocomplete="new-password"></label>
+    <button id="btn-sa-save" type="button">Set server account</button>
+    <button id="btn-sa-remove" type="button">Remove</button>
+    <div class="msg" id="sa-msg"></div>
+    <label><span>Pause between read rounds (s)</span><input type="number" id="cfg-pollSeconds" min="1" max="3600" style="width:90px"></label>
+    <label><span>A state counts as fresh for (s)</span><input type="number" id="cfg-freshSeconds" min="5" max="86400" style="width:90px"></label>
+    <label><span>Log out after idle minutes</span><input type="number" id="cfg-idleMinutes" min="1" max="720" style="width:90px"></label>
+  </fieldset>
+  <fieldset id="fs-aliases"><legend>Aliases</legend>
+    <p class="hint">An alias is a friendly name for a door (shown in the Alias column of the Doors tab). Export the doors as CSV (id;name;alias), fill in the alias column, import it back. The first column may also be the door name when the id is not known. An empty alias removes the entry. A single alias can also be edited in the Doors table (click the Alias cell).</p>
+    <p><button id="btn-alias-export" type="button">Export doors as CSV</button>
+    <label><span>CSV file (id;alias)</span><input type="file" id="alias-file" accept=".csv,text/csv,text/plain"></label>
+    <button id="btn-alias-import" type="button">Import aliases</button></p>
+    <div class="msg" id="alias-msg"></div>
   </fieldset>
   <div id="setup-doorstate"></div>
   <div id="setup-locations"></div>
@@ -2664,9 +4326,18 @@ button.arm-btn{height:26px;padding:0 8px;font-size:12px}
 </div>
 
 <div class="panel" id="tab-audit">
-  <button id="btn-audit-refresh">Refresh</button> <span id="audit-chain"></span>
+  <div class="aud-filter">
+    <label><span>AEOS or Windows user</span><input type="text" id="aud-user" size="14"></label>
+    <label><span>Door (name, alias or id)</span><input type="text" id="aud-door" size="18"></label>
+    <label><span>Action</span><select id="aud-action"><option value="all">All</option><option value="opened">Opened (unlock or access)</option><option value="lock">lock</option><option value="unlock">unlock</option><option value="access">access</option><option value="normal">normal</option><option value="login">login</option><option value="logout">logout</option><option value="raw-socket">raw-socket</option></select></label>
+    <label><span>From (UTC date)</span><input type="date" id="aud-from"></label>
+    <label><span>To (UTC date)</span><input type="date" id="aud-to"></label>
+    <button id="btn-audit-refresh">Refresh</button>
+    <button id="btn-audit-export" type="button">Export CSV</button>
+  </div>
+  <span id="audit-chain"></span> <span id="audit-count"></span>
   <div class="msg" id="audit-msg"></div>
-  <table><thead><tr><th>Time (UTC)</th><th>Windows user</th><th>AEOS user</th><th>Action</th><th>Door</th><th>HTTP</th><th>OK</th><th>Fault</th></tr></thead>
+  <table><thead><tr><th>Time (UTC)</th><th>Computer</th><th>Windows user</th><th>AEOS user</th><th>Action</th><th>Door</th><th>Alias</th><th>HTTP</th><th>OK</th><th>Fault</th></tr></thead>
   <tbody id="audit-body"></tbody></table>
 </div>
 
@@ -2700,13 +4371,21 @@ button.arm-btn{height:26px;padding:0 8px;font-size:12px}
 (function(){
 'use strict';
 var TOKEN=document.querySelector('meta[name="console-token"]').getAttribute('content');
+var ANON=TOKEN;
+/* The page key: the key of the session once logged in (X-Console-Token), else the one the page came with (empty behind the proxy). The meta tag follows. */
+function setToken(t){TOKEN=t||ANON;var m=document.querySelector('meta[name="console-token"]');if(m){m.setAttribute('content',TOKEN);}}
 var ACTIONS=['listDoors','lock','unlock','access','normal'];
 var DOOR_ACTIONS=['lock','unlock','access','normal'];
 var CFG=null,LIC=null,OPS=[],DOORS=[],debugTimer=null,SEL={},STATES={},RES={},BATCH_BUSY=false,DS_ROWS=4;
 var PLACE={},NODES={},TREE_DOORS=null,TREE_LOC='',LOCFILTER='',ARMREP=null;
+/* Session and role (the server decides; the page only hides), fresh and last-known door states, sort, per-user settings */
+var SESSION=null,FRESH={},LAST={},SORT={col:'',dir:''},READGEN=0,ME_TIMER=null,ME_APPLYING=false,STATE_CHUNK=100;
+/* Live states (server account): ACCT = the server reads the states with its own account (freshness then always expires), LIVE = that read works right now. The page asks for the changes since its last version every 3 s, with a back-off while it fails. FRESH[id] is true (read by this page, no server account) or the time (ms) until the state counts as fresh. */
+var LIVE=false,VER=0,FRESHSEC=120,POLL_TIMER=null,POLL_BUSY=false,SA_TIMER=null,FRESH_TIMER=null,TIMED=false,ACCT=false,POLL_DELAY=3000,POLL_GEN=0,SESSGEN=0;
 /* Doors table pager: PAGESIZE 0 = all rows; kept per browser (the page works without storage) */
 var PAGE_SIZES=[25,50,100,250,500,0],PAGE=1,PAGEKEY='',PAGEROWS=[];
-var PAGESIZE=(function(){try{var v=parseInt(localStorage.getItem('dk-rows-per-page'),10);if(PAGE_SIZES.indexOf(v)>=0){return v;}}catch(e){}return 100;})();
+function storedPageSize(){try{var v=parseInt(localStorage.getItem('dk-rows-per-page'),10);if(PAGE_SIZES.indexOf(v)>=0){return v;}}catch(e){}return 100;}
+var PAGESIZE=storedPageSize();
 function $(id){return document.getElementById(id);}
 function h(tag,attrs,kids){
   var e=document.createElement(tag);
@@ -2718,9 +4397,12 @@ function h(tag,attrs,kids){
 }
 function api(method,path,body,rawText){
   var opt={method:method,headers:{'X-Console-Token':TOKEN}};
+  var gen=SESSGEN;
   if(body!==undefined){opt.headers['Content-Type']='application/json';opt.body=rawText?body:JSON.stringify(body);}
   return fetch(path,opt).then(function(r){
     return r.text().then(function(txt){
+      /* an answer for a session that has ended since the request left is dropped (no data of the last user reaches the page) */
+      if(gen!==SESSGEN){var ce=new Error('The session ended.');ce.cancelled=true;ce.rid='-';throw ce;}
       var j=null;try{j=JSON.parse(txt);}catch(e){}
       var rid=(j&&j.requestId)||r.headers.get('X-Request-Id')||'-';
       if(!r.ok){
@@ -2733,13 +4415,15 @@ function api(method,path,body,rawText){
           msg='DoorKeeper was restarted, so this page was out of date and reloads itself. If this message stays, open '+location.origin+'/ again.';
         }
         var er=new Error(msg);
-        er.rid=rid;er.code=(j&&j.error&&j.error.code)||'';throw er;
+        er.rid=rid;er.code=(j&&j.error&&j.error.code)||'';
+        if(r.status===401&&er.code==='session_expired'){sessionLost(msg);}
+        throw er;
       }
       j=j||{};j._rid=rid;return j;
     });
   },function(e){var er=new Error('Cannot reach the console process: '+e.message);er.rid='-';throw er;});
 }
-function errText(e){return e.message+' (request id '+(e.rid||'-')+')';}
+function errText(e){return e.cancelled?'':(e.message+' (request id '+(e.rid||'-')+')');}
 function setMsg(id,text,cls){var m=$(id);m.textContent=text||'';m.className='msg'+(cls?' '+cls:'');}
 function download(path,fname){
   return fetch(path,{headers:{'X-Console-Token':TOKEN}}).then(function(r){
@@ -2780,10 +4464,13 @@ $('about').onclick=function(e){if(e.target===$('about')){$('about').style.displa
 
 /* ---- tabs ---- */
 function showTab(name){
+  if(!isAdmin()&&name!=='doors'){name='doors';}
   Array.prototype.forEach.call(document.querySelectorAll('.tab'),function(b){b.classList.toggle('active',b.getAttribute('data-tab')===name);});
   Array.prototype.forEach.call(document.querySelectorAll('.panel'),function(p){p.classList.toggle('active',p.id==='tab-'+name);});
   if(debugTimer){clearInterval(debugTimer);debugTimer=null;}
   if(name==='audit'){loadAudit();}
+  if(SA_TIMER){clearInterval(SA_TIMER);SA_TIMER=null;}
+  if(name==='setup'){loadServerAccount();SA_TIMER=setInterval(loadServerAccount,4000);}
   if(name==='debug'){loadDebug();debugTimer=setInterval(loadDebug,3000);}
 }
 Array.prototype.forEach.call(document.querySelectorAll('.tab'),function(b){b.onclick=function(){showTab(b.getAttribute('data-tab'));};});
@@ -2802,11 +4489,15 @@ function renderBanners(){
   if(CFG&&CFG.socket&&CFG.socket.tlsSkipValidation){b.appendChild(h('div',{class:'warn',text:'WARNING: TLS certificate validation is OFF for the socket interface. The AEOS server identity is not checked.'}));}
   if(CFG&&CFG.socket&&CFG.socket.tls===false&&socketInUse()){b.appendChild(h('div',{class:'warn',text:'WARNING: the socket interface is used without TLS. The password is sent unencrypted.'}));}
   if(CFG&&/^http:/i.test(CFG.aeosUrl||'')){b.appendChild(h('div',{class:'warn',text:'WARNING: the AEOS URL is plain http. The password is sent unencrypted.'}));}
+  if(SESSION&&SESSION.noAdmins){
+    if(SESSION.behindProxy){b.appendChild(h('div',{class:'err',id:'admin-banner',text:'No admin is set. An administrator of the server must add AEOS user names to access.admins in the DoorKeeper config file and restart the site.'}));}
+    else{b.appendChild(h('div',{class:'err',id:'admin-banner',text:'No admin is set: every user can change settings. Add admins on the Setup tab.'}));}
+  }
   if(LIC&&!LIC.actionsAllowed){
     var hostTxt=LIC.aeosHost?(' AEOS host to send to your supplier: '+LIC.aeosHost+'.'):'';
     b.appendChild(h('div',{class:'err',id:'lic-banner',text:'Door actions are switched off. '+LIC.reason+hostTxt}));
   }
-  $('aeos-url').textContent=(CFG&&CFG.aeosUrl)?CFG.aeosUrl:'(AEOS URL not set - open Setup)';
+  $('aeos-url').textContent=(CFG&&CFG.aeosUrl)?CFG.aeosUrl:(CFG?'(AEOS URL not set - open Setup)':'');
 }
 /* ---- license ---- */
 function licBlocked(){return !!(LIC&&!LIC.actionsAllowed);}
@@ -2880,23 +4571,118 @@ $('btn-import-license').onclick=function(){
     LIC=r;renderLicense();setMsg('lic-msg','License imported and saved (request id '+r._rid+').','good');
   }).catch(function(e){setMsg('lic-msg','License file refused: '+errText(e),'bad');});
 };
+function isAdmin(){return !!SESSION&&SESSION.role==='admin';}
+function loggedIn(){return !!SESSION&&!!SESSION.loggedIn;}
 function renderSession(s){
+  SESSION=s;setToken(s.csrf);
   $('login-box').style.display=s.loggedIn?'none':'';
   $('logout-box').style.display=s.loggedIn?'':'none';
-  $('login-state').textContent=s.loggedIn?('logged in as '+s.user):'';
+  $('login-state').textContent=s.loggedIn?('logged in as '+s.user+(s.role==='admin'?' (admin)':'')):'';
+  $('btn-load-doors').disabled=!s.loggedIn;$('btn-load-doors').title=s.loggedIn?'':'Log in with an AEOS user first.';
+  document.body.classList.toggle('role-admin',isAdmin());
+  var act=document.querySelector('.tab.active');
+  if(act&&!isAdmin()&&act.getAttribute('data-tab')!=='doors'){showTab('doors');}
+  renderBanners();renderDoors();
+}
+/* The config and the license need a session behind the proxy, so they load after the login (without the proxy, at the start). */
+function loadAll(){
+  return api('GET','/api/v1/config').then(function(c){
+    CFG=c;fillSetup();renderBanners();renderDoors();return loadLicense();
+  });
+}
+/* Nothing of the last user stays on the page. */
+function clearView(){
+  stopPolling();LIVE=false;ACCT=false;READGEN++;if(FRESH_TIMER){clearInterval(FRESH_TIMER);FRESH_TIMER=null;}
+  DOORS=[];SEL={};STATES={};FRESH={};LAST={};RES={};PAGE=1;ARMREP=null;BATCH_BUSY=false;
+  $('arm-report').style.display='none';$('job-bar').style.display='none';
+  if(SESSION&&SESSION.behindProxy){CFG=null;LIC=null;}
+  renderDoors();
+}
+/* Audit, debug, raw call results, diagnostics, reports and every pending answer of the last user leave the page. */
+function clearAdminData(){
+  SESSGEN++;
+  if(debugTimer){clearInterval(debugTimer);debugTimer=null;}
+  if(SA_TIMER){clearInterval(SA_TIMER);SA_TIMER=null;}
+  ['audit-body','debug-out','raw-out','raw-socket-out','test-list-out','diag-out','arm-report-failed'].forEach(function(id){var e=$(id);if(e){e.textContent='';}});
+  ['audit-chain','audit-count','audit-msg','debug-msg','debug-file','raw-msg','raw-socket-msg','sa-msg','setup-msg','lic-msg','alias-msg','wsdl-status','doors-msg'].forEach(function(id){var e=$(id);if(e){e.textContent='';}});
+  $('sa-status').textContent='';$('sa-user').value='';$('sa-password').value='';$('raw-socket-cmd').value='';
+  ARMREP=null;$('arm-report').style.display='none';$('job-bar').style.display='none';
+  showTab('doors');
+}
+function sessionLost(msg){
+  var bp=!!(SESSION&&SESSION.behindProxy),na=!!(SESSION&&SESSION.noAdmins);
+  clearAdminData();
+  SESSION={loggedIn:false,user:'',role:'operator',noAdmins:na,behindProxy:bp,csrf:''};
+  clearView();renderSession(SESSION);$('login-msg').textContent=msg||'Your session ended. Log in again.';
+}
+/* per-user settings (server side, per AEOS user): rows per page, sort, filter text, selected tree node */
+function applyMe(s){
+  if(!s){return;}
+  ME_APPLYING=true;
+  if(PAGE_SIZES.indexOf(s.rows)>=0){PAGESIZE=s.rows;}
+  SORT=s.sortCol?{col:s.sortCol,dir:(s.sortDir==='desc'?'desc':'asc')}:{col:'',dir:''};
+  $('door-filter').value=s.filter||'';
+  LOCFILTER=s.node||'';
+  PAGE=1;PAGEKEY='';
+  ME_APPLYING=false;
+  renderDoors();
+}
+function loadMe(){
+  if(!loggedIn()){return Promise.resolve();}
+  return api('GET','/api/v1/me/settings').then(function(r){applyMe(r.settings);}).catch(function(){});
+}
+function meBody(){return {rows:PAGESIZE,sortCol:SORT.col,sortDir:SORT.dir,filter:$('door-filter').value.slice(0,200),node:LOCFILTER};}
+function saveMe(now){
+  if(!loggedIn()||ME_APPLYING){return Promise.resolve();}
+  if(ME_TIMER){clearTimeout(ME_TIMER);ME_TIMER=null;}
+  function send(){ME_TIMER=null;return api('PUT','/api/v1/me/settings',meBody()).catch(function(){});}
+  if(now){return send();}
+  ME_TIMER=setTimeout(send,500);
+  return Promise.resolve();
+}
+function flushMe(){return ME_TIMER?saveMe(true):Promise.resolve();}
+function resetView(){
+  ME_APPLYING=true;
+  PAGESIZE=storedPageSize();SORT={col:'',dir:''};$('door-filter').value='';LOCFILTER='';PAGE=1;PAGEKEY='';
+  ME_APPLYING=false;
+  renderDoors();
 }
 $('btn-login').onclick=function(){
-  setMsg('login-msg','');
+  setMsg('login-msg','');$('login-msg').textContent='';
   api('POST','/api/v1/login',{user:$('user').value,password:$('password').value}).then(function(r){
     $('password').value='';renderSession(r);
+    return (CFG?Promise.resolve():loadAll()).then(function(){renderSession(r);if(DOORS.length){$('btn-load-doors').click();}return loadMe();});
   }).catch(function(e){$('login-msg').textContent=errText(e);});
 };
 $('password').onkeydown=function(ev){if(ev.key==='Enter'){$('btn-login').click();}};
-$('btn-logout').onclick=function(){api('POST','/api/v1/logout').then(renderSession).catch(function(e){$('login-msg').textContent=errText(e);});};
+$('btn-logout').onclick=function(){
+  flushMe().then(function(){return api('POST','/api/v1/logout');}).then(function(s){clearAdminData();renderSession(s);stopPolling();LIVE=false;ACCT=false;if(s.behindProxy){clearView();}resetView();}).catch(function(e){$('login-msg').textContent=errText(e);});
+};
 
 /* ---- doors ---- */
 function stateOn(){return !!(CFG&&CFG.doorState&&CFG.doorState.checks&&CFG.doorState.checks.length);}
 function slim(d){return {id:d.id,name:d.name,extra:d.extra||{}};}
+function aliasOf(d){var a=CFG&&CFG.aliases;return (a&&hasOwn(a,d.id))?String(a[d.id]):'';}
+function doorTitle(d){var a=aliasOf(d);return d.name+(a?(' / '+a):'');}
+/* the state shown for a door: the fresh one of this load, else the last known one (muted) */
+function stOf(id){return STATES[id]||LAST[id]||null;}
+function isFresh(id){var f=FRESH[id];return !!f&&(f===true||f>Date.now());}
+function allFresh(ids){if(!stateOn()){return true;}for(var i=0;i<ids.length;i++){if(!isFresh(ids[i])){return false;}}return true;}
+function freshCount(ids){var n=0;ids.forEach(function(id){if(isFresh(id)){n++;}});return n;}
+/* why a door's action buttons are off ('' = ready): the rule is that no command goes out before the fresh state of this load is known */
+function doorBlock(d){
+  if(licBlocked()){return licTip();}
+  if(!loggedIn()){return 'Log in with an AEOS user first.';}
+  if(stateOn()&&!isFresh(d.id)){return (ACCT&&FRESH[d.id])?'The state of this door is older than '+FRESHSEC+' seconds. Waiting for the next live read.':'Waiting for the current state of this door.';}
+  return '';
+}
+function batchBlock(ids){
+  if(licBlocked()){return licTip();}
+  if(!loggedIn()){return 'Log in with an AEOS user first.';}
+  if(!allFresh(ids)){return 'Waiting for the current state: '+freshCount(ids)+' of '+ids.length+' door(s) read.';}
+  return '';
+}
+function idsOf(doors){return doors.map(function(d){return d.id;});}
 /* ---- locations: JS twin of Get-DoorLocation / Test-DoorInGroup on the server (tests\fixtures\locations.json feeds both) ---- */
 function hasOwn(o,k){return Object.prototype.hasOwnProperty.call(o,k);}
 function placeDoor(d,loc){
@@ -2952,20 +4738,58 @@ function groupDoors(g){return DOORS.filter(function(d){return PLACE[d.id]&&doorI
 function stateSummary(ids){
   if(!stateOn()){return '';}
   var n={},order=['Locked','Unlocked','Normal'];
-  ids.forEach(function(id){var st=STATES[id];if(st){n[st.state]=(n[st.state]||0)+1;}});
+  ids.forEach(function(id){var st=stOf(id);if(st){n[st.state]=(n[st.state]||0)+1;}});
   var keys=Object.keys(n).sort(function(a,b){var x=order.indexOf(a),y=order.indexOf(b);x=x<0?99:x;y=y<0?99:y;return x!==y?x-y:(a<b?-1:1);});
   return keys.map(function(k){return n[k]+' '+k;}).join(', ');
+}
+/* sort: first click ascending, second descending, third back to the list order; text is case-insensitive and natural (D2 before D10);
+   empty values go last. Sorting happens before paging. */
+function sortVal(d,col){
+  if(col==='alias'){return aliasOf(d);}
+  if(col==='name'){return String(d.name||'');}
+  if(col==='id'){return String(d.id);}
+  if(col==='state'){var st=stOf(d.id);return st?String(st.state):'';}
+  if(col.indexOf('x:')===0){return String((d.extra&&d.extra[col.slice(2)])||'');}
+  if(col.indexOf('l:')===0){var pl=PLACE[d.id];return String((pl&&pl.fields[col.slice(2)])||'');}
+  return '';
+}
+function sortDoors(list){
+  if(!SORT.col||!SORT.dir){return list;}
+  var dir=(SORT.dir==='desc')?-1:1;
+  var keyed=list.map(function(d,i){return {d:d,i:i,v:sortVal(d,SORT.col)};});
+  keyed.sort(function(a,b){
+    if(a.v===''&&b.v!==''){return 1;}
+    if(b.v===''&&a.v!==''){return -1;}
+    var c=a.v.localeCompare(b.v,undefined,{numeric:true,sensitivity:'base'});
+    return c?c*dir:a.i-b.i;
+  });
+  return keyed.map(function(k){return k.d;});
+}
+function clickSort(col){
+  if(SORT.col!==col){SORT={col:col,dir:'asc'};}
+  else if(SORT.dir==='asc'){SORT={col:col,dir:'desc'};}
+  else{SORT={col:'',dir:''};}
+  PAGE=1;renderDoors();saveMe();
+}
+function sortTh(text,col,attrs){
+  var a=(SORT.col===col)?SORT.dir:'';
+  var at={'class':'sortable','data-col':col,'data-sort':a,'aria-sort':(a==='asc'?'ascending':(a==='desc'?'descending':'none')),title:'Click to sort'};
+  Object.keys(attrs||{}).forEach(function(k){at[k]=(k==='class')?('sortable '+attrs[k]):attrs[k];});
+  var t=h('th',at);
+  t.appendChild(document.createTextNode(text+(a==='asc'?' \u25B2':(a==='desc'?' \u25BC':''))));
+  t.onclick=function(){clickSort(col);};
+  return t;
 }
 function visibleDoors(){
   var f=$('door-filter').value.toLowerCase();
   var set=(LOCFILTER&&NODES[LOCFILTER])?NODES[LOCFILTER].set:null;
-  return DOORS.filter(function(d){
+  return sortDoors(DOORS.filter(function(d){
     if(set&&!set[d.id]){return false;}
     if(!f){return true;}
     var pl=PLACE[d.id],loc='';
     if(pl){loc=Object.keys(pl.fields).map(function(k){return pl.fields[k]+' '+labelOf(pl.fields[k]);}).join(' ');}
-    return (d.name+' '+d.id+' '+loc).toLowerCase().indexOf(f)>=0;
-  });
+    return (d.name+' '+d.id+' '+aliasOf(d)+' '+loc).toLowerCase().indexOf(f)>=0;
+  }));
 }
 function selectedDoors(){return DOORS.filter(function(d){return SEL[d.id];});}
 function rowOf(id){
@@ -2981,18 +4805,40 @@ function setRowResult(id,cls,text,rid){
   RES[id]={cls:cls,text:text,rid:rid};
   var row=rowOf(id);if(row){paintResult(row.querySelector('td.result'),RES[id]);}
 }
-function paintState(td,st){
+function hhmm(iso){var d=new Date(iso);if(isNaN(d.getTime())){return '';}function p(n){return (n<10?'0':'')+n;}return p(d.getHours())+':'+p(d.getMinutes());}
+/* last=true: the state is the remembered one from an earlier read, painted muted until the fresh read of this load arrives */
+function paintState(td,st,last){
   var k=stateKind(st.state);
-  td.title=st.detail||'';td.className='state'+(st.state==='?'?' unknown':'');
+  td.title=last?('last known '+hhmm(st.at)+(st.detail?(' - '+st.detail):'')):(st.detail||'');
+  td.className='state'+(st.state==='?'?' unknown':'')+(last?' last':'');
+  if(last){td.setAttribute('data-last','1');}else{td.removeAttribute('data-last');}
   td.innerHTML='';
-  var c=h('span',{class:'schip s-'+k});c.innerHTML=STATE_ICONS[k];c.appendChild(document.createTextNode(st.state));
+  var c=h('span',{class:'schip s-'+k+(last?' last':'')});c.innerHTML=STATE_ICONS[k];c.appendChild(document.createTextNode(st.state));
   td.appendChild(c);
 }
-function setState(id,state,detail){
-  STATES[id]={state:state,detail:detail};
-  var row=rowOf(id);if(row){paintState(row.querySelector('td.state'),STATES[id]);}
-  renderCounts();
+function paintStateCell(id){
+  var row=rowOf(id);if(!row){return;}
+  var td=row.querySelector('td.state');if(!td){return;}
+  if(STATES[id]){paintState(td,STATES[id],false);}else if(LAST[id]){paintState(td,LAST[id],true);}
 }
+function paintRowButtons(id){
+  var row=rowOf(id);if(!row){return;}
+  var d=null;for(var i=0;i<DOORS.length;i++){if(DOORS[i].id===id){d=DOORS[i];break;}}
+  if(!d){return;}
+  var why=doorBlock(d);
+  Array.prototype.forEach.call(row.querySelectorAll('button.act'),function(b){if(!b.getAttribute('data-busy')){b.disabled=!!why;b.title=why;}});
+}
+/* a read state ("?" = the read failed) is fresh only when it is a real answer */
+function applyStates(list){
+  list.forEach(function(x){
+    STATES[x.id]={state:x.state,detail:x.detail};
+    if(ACCT){TIMED=true;}
+    FRESH[x.id]=(x.state==='?')?false:(ACCT?(Date.now()+Math.max(0,FRESHSEC-(x.ageSec||0))*1000):true);
+    paintStateCell(x.id);paintRowButtons(x.id);
+  });
+  updateBatchBar();
+}
+function setState(id,state,detail){applyStates([{id:id,state:state,detail:detail}]);}
 function renderCounts(){
   paintTree();
   var box=$('door-counts');box.innerHTML='';
@@ -3000,16 +4846,18 @@ function renderCounts(){
   box.appendChild(h('span',{text:DOORS.length+' doors'}));
   if(!stateOn()){return;}
   var n={locked:0,unlocked:0,normal:0,unknown:0};
-  DOORS.forEach(function(d){var st=STATES[d.id];n[st?stateKind(st.state):'unknown']+=1;});
+  DOORS.forEach(function(d){var st=stOf(d.id);n[st?stateKind(st.state):'unknown']+=1;});
   ['locked','unlocked','normal','unknown'].forEach(function(k){box.appendChild(h('span',{class:'s-'+k,text:n[k]+' '+k}));});
 }
 function updateBatchBar(){
   var sel=selectedDoors().length;
   $('batch-bar').style.display=DOORS.length?'':'none';
   $('batch-count').textContent=sel+' selected';
-  Array.prototype.forEach.call($('batch-buttons').children,function(b){b.disabled=(sel===0)||BATCH_BUSY||licBlocked();b.title=licTip();});
+  var selWhy=batchBlock(Object.keys(SEL).filter(function(k){return SEL[k];}));
+  Array.prototype.forEach.call($('batch-buttons').children,function(b){b.disabled=(sel===0)||BATCH_BUSY||!!selWhy;b.title=selWhy;});
   $('btn-lockdown').style.display=isMapped(CFG&&CFG.actions.lock)?'':'none';
-  $('btn-lockdown').disabled=BATCH_BUSY||!DOORS.length||licBlocked();$('btn-lockdown').title=licTip();
+  var allWhy=batchBlock(idsOf(DOORS));
+  $('btn-lockdown').disabled=BATCH_BUSY||!DOORS.length||!!allWhy;$('btn-lockdown').title=allWhy;
   $('btn-refresh-state').style.display=stateOn()?'':'none';
   Array.prototype.forEach.call($('doors-body').children,function(r){r.classList.toggle('picked',!!SEL[r.getAttribute('data-id')]);});
   renderCounts();
@@ -3036,7 +4884,7 @@ function renderPager(total,pages){
     if(w==='top'){
       var sel=h('select',{id:'pg-size'});
       PAGE_SIZES.forEach(function(n){var o=h('option',{value:String(n),text:n?String(n):'All'});o.selected=(n===PAGESIZE);sel.appendChild(o);});
-      sel.onchange=function(){PAGESIZE=parseInt(sel.value,10)||0;try{localStorage.setItem('dk-rows-per-page',String(PAGESIZE));}catch(e){}PAGE=1;renderDoors();};
+      sel.onchange=function(){PAGESIZE=parseInt(sel.value,10)||0;if(loggedIn()){saveMe();}else{try{localStorage.setItem('dk-rows-per-page',String(PAGESIZE));}catch(e){}}PAGE=1;renderDoors();};
       box.appendChild(h('label',null,['Rows per page ',sel]));
       box.appendChild(h('span',{id:'pg-selnote'}));
     }
@@ -3072,11 +4920,15 @@ function paintArm(sel){
     var why='';
     if(licBlocked()){why=licTip();}
     else if(!info.mapped){why='Not available: the "'+info.key+'" action is not mapped on the Setup tab.';}
+    else{
+      var ids=own?Object.keys(SEL).filter(function(k){return SEL[k];}):(b._ids?b._ids():null);
+      if(ids){why=batchBlock(ids);}
+    }
     b.disabled=!!why||BATCH_BUSY||(own&&sel===0)||b.getAttribute('data-n')==='0';
     b.title=why;
   });
   var rb=$('arm-retry');
-  if(rb){rb.disabled=BATCH_BUSY||licBlocked()||!ARMREP||!ARMREP.failed.length;}
+  if(rb){rb.disabled=BATCH_BUSY||licBlocked()||!loggedIn()||!ARMREP||!ARMREP.failed.length||!allFresh(ARMREP.failed);}
 }
 function selScope(doors){
   if(!locLevels().length){return {name:'the selection',label:'selection of '+doors.length+' doors'};}
@@ -3137,10 +4989,11 @@ function renderNode(n){
   var row=h('div',{'class':'loc-row'},[cb,nm,sum,ar,di]);
   n.cb=cb;n.sum=sum;n.row=row;
   cb.onchange=function(){applySel(n.ids,cb.checked);};
-  nm.onclick=function(){LOCFILTER=(LOCFILTER===n.key)?'':n.key;renderDoors();};
+  nm.onclick=function(){LOCFILTER=(LOCFILTER===n.key)?'':n.key;renderDoors();saveMe();};
   var scope={name:(n.key==='(unplaced)')?'the doors without a location':pathName(n.path),label:'location: '+n.key};
   ar.onclick=function(){armRun('arm',nodeDoors(n),scope);};
   di.onclick=function(){armRun('disarm',nodeDoors(n),scope);};
+  ar._ids=di._ids=function(){return n.ids;};
   var li=h('li',{'data-path':n.key},[row]);
   if(n.children.length){
     var ul=h('ul',{'class':'loc-ul'});
@@ -3187,6 +5040,7 @@ function renderGroups(){
     sel.onclick=function(){selectOnly(ds.map(function(d){return d.id;}));};
     ar.onclick=function(){armRun('arm',ds,scope);};
     di.onclick=function(){armRun('disarm',ds,scope);};
+    ar._ids=di._ids=function(){return idsOf(ds);};
     box.appendChild(h('div',{'class':'grp','data-group':g.name},[h('b',{'class':'grp-name',text:g.name}),
       h('span',{'class':'grp-count',text:ds.length+' door'+(ds.length===1?'':'s')}),sel,ar,di]));
   });
@@ -3206,7 +5060,8 @@ function showReport(r,doors,a,meta){
   fails.forEach(function(x){
     var pl=PLACE[x.id];
     var stt=STATES[x.id];
-    body.appendChild(h('tr',{'data-id':x.id},[h('td',{text:x.name+' ('+x.id+')'}),h('td',{text:pl?pl.text:''}),
+    var xa=aliasOf({id:x.id});
+    body.appendChild(h('tr',{'data-id':x.id},[h('td',{text:x.name+(xa?(' / '+xa):'')+' ('+x.id+')'}),h('td',{text:pl?pl.text:''}),
       h('td',{text:(x.fault||'no reply')+(x.refused?' (refused, not sent)':'')}),h('td',{text:stt?stt.state:''})]));
   });
   $('arm-report-table').style.display=fails.length?'':'none';
@@ -3214,20 +5069,21 @@ function showReport(r,doors,a,meta){
   paintArm(selectedDoors().length);
 }
 function renderDoors(){
+  if(!CFG){$('doors-head').innerHTML='';$('doors-body').innerHTML='';$('batch-bar').style.display='none';$('door-counts').innerHTML='';$('pager-top').style.display='none';$('pager-bottom').style.display='none';return;}
   var extras=(CFG&&CFG.actions.listDoors.extraFields)||[];
   var levels=locLevels();
   placeAll();
   if(TREE_DOORS!==DOORS||TREE_LOC!==JSON.stringify((CFG&&CFG.locations)||null)){renderTree();}
-  if(LOCFILTER&&!NODES[LOCFILTER]){LOCFILTER='';}
+  if(DOORS.length&&LOCFILTER&&!NODES[LOCFILTER]){LOCFILTER='';}
   renderGroups();
   $('loc-side').style.display=(DOORS.length&&(levels.length||((CFG&&CFG.groups)||[]).length))?'':'none';
   $('loc-tree-box').style.display=levels.length?'':'none';
   var head=$('doors-head');head.innerHTML='';
   var selAll=h('input',{type:'checkbox',id:'sel-all',title:'Select all doors on this page'});
-  var tr=h('tr',null,[h('th',null,[selAll]),h('th',{text:'Name'}),h('th',{text:'Id'})]);
-  extras.forEach(function(x){tr.appendChild(h('th',{text:x}));});
-  levels.forEach(function(x){tr.appendChild(h('th',{'class':'loc-th','data-level':x,text:x}));});
-  if(stateOn()){tr.appendChild(h('th',{text:'State'}));}
+  var tr=h('tr',null,[h('th',null,[selAll]),sortTh('Alias','alias'),sortTh('Name','name'),sortTh('Id','id')]);
+  extras.forEach(function(x){tr.appendChild(sortTh(x,'x:'+x));});
+  levels.forEach(function(x){tr.appendChild(sortTh(x,'l:'+x,{'class':'loc-th','data-level':x}));});
+  if(stateOn()){tr.appendChild(sortTh('State','state'));}
   tr.appendChild(h('th',{text:'Actions'}));tr.appendChild(h('th',{text:'Result'}));head.appendChild(tr);
   selAll.onchange=function(){
     PAGEROWS.forEach(function(d){
@@ -3247,7 +5103,7 @@ function renderDoors(){
     bb.appendChild(b);
   });
   var vis=visibleDoors();
-  var key=$('door-filter').value+'|'+LOCFILTER;
+  var key=$('door-filter').value+'|'+LOCFILTER+'|'+SORT.col+'|'+SORT.dir;
   if(key!==PAGEKEY){PAGEKEY=key;PAGE=1;}
   var pages=PAGESIZE?Math.max(1,Math.ceil(vis.length/PAGESIZE)):1;
   if(PAGE>pages){PAGE=pages;}
@@ -3259,14 +5115,16 @@ function renderDoors(){
     var cb=h('input',{type:'checkbox','class':'sel','data-id':d.id});
     cb.checked=!!SEL[d.id];
     cb.onchange=function(){SEL[d.id]=cb.checked;updateBatchBar();};
-    var row=h('tr',{'data-id':d.id},[h('td',null,[cb]),h('td',{text:d.name}),h('td',{text:d.id})]);
+    var acell=h('td',{'class':'alias'+(isAdmin()?' editable':''),text:aliasOf(d)});
+    if(isAdmin()){acell.title='Click to edit the alias';acell.onclick=function(){editAlias(acell,d);};}
+    var row=h('tr',{'data-id':d.id},[h('td',null,[cb]),acell,h('td',{'class':'dname',text:d.name}),h('td',{text:d.id})]);
     extras.forEach(function(x){row.appendChild(h('td',{text:(d.extra&&d.extra[x])||''}));});
     var pl=PLACE[d.id];
     row.setAttribute('data-loc',pl?pl.text:'');
     levels.forEach(function(x){var v=(pl&&pl.fields[x])||'';row.appendChild(h('td',{'class':'loc-td','data-level':x,text:v,title:(v&&labelOf(v)!==v)?labelOf(v):''}));});
     if(stateOn()){
       var stc=h('td',{class:'state'});
-      if(STATES[d.id]){paintState(stc,STATES[d.id]);}
+      if(STATES[d.id]){paintState(stc,STATES[d.id],false);}else if(LAST[d.id]){paintState(stc,LAST[d.id],true);}
       row.appendChild(stc);
     }
     var acts=h('td');var res=h('td',{class:'result'});
@@ -3275,7 +5133,7 @@ function renderDoors(){
       var def=CFG.actions[a];if(!isMapped(def)){return;}
       var btn=h('button',{class:'act','data-action':a,text:def.label||a});
       btn.onclick=function(){runAction(a,d,btn);};
-      btn.disabled=licBlocked();btn.title=licTip();
+      var why=doorBlock(d);btn.disabled=!!why;btn.title=why;
       acts.appendChild(btn);
     });
     row.appendChild(acts);row.appendChild(res);body.appendChild(row);
@@ -3284,36 +5142,89 @@ function renderDoors(){
 }
 function runAction(a,d,btn){
   var def=CFG.actions[a];
-  var p=(def.confirm===false)?Promise.resolve(true):confirmDialog((def.label||a)+' door "'+d.name+'" ('+d.id+')?');
+  var al=aliasOf(d);
+  var p=(def.confirm===false)?Promise.resolve(true):confirmDialog((def.label||a)+' door "'+d.name+'"'+(al?(' (alias "'+al+'")'):'')+' ('+d.id+')?');
   p.then(function(ok){
     if(!ok){return;}
-    btn.disabled=true;setRowResult(d.id,'','working...');
+    btn.disabled=true;btn.setAttribute('data-busy','1');setRowResult(d.id,'','working...');
     return api('POST','/api/v1/doors/action',{action:a,id:d.id,name:d.name,extra:d.extra||{}}).then(function(r){
       setRowResult(d.id,r.ok?'ok':'bad',r.ok?(r.transport==='socket'?('OK (socket) reply: '+(r.reply||'')+' request id '+r._rid):('OK (HTTP '+r.httpStatus+') request id '+r._rid)):('FAILED: '+(r.fault||('HTTP '+r.httpStatus))+' (request id '+r._rid+')'),r._rid);
       if(r.state!==undefined&&r.state!==null){setState(d.id,r.state,r.stateDetail);}
-      else if(stateOn()){return refreshStates([d]);}
+      else if(stateOn()){return readSome([d]);}
     }).catch(function(e){
       setRowResult(d.id,'bad','FAILED: '+errText(e),e.rid||'-');
-    }).then(function(){btn.disabled=licBlocked();});
+    }).then(function(){btn.removeAttribute('data-busy');paintRowButtons(d.id);});
   });
 }
 /* State of the listed doors: one request, one socket session on the server. */
+/* Progressive read: chunks of STATE_CHUNK doors, one request (one socket session) each; every chunk paints as it arrives and
+   enables the buttons of its doors. A newer read (new Load doors, Refresh state) makes an older one stop. */
 function refreshStates(doors){
   if(!stateOn()||!doors.length){return Promise.resolve();}
+  var gen=++READGEN,total=doors.length,done=0,failed=null,rid='',seen={};
+  var CH=Math.max(1,Math.min(STATE_CHUNK,(CFG&&CFG.doorState&&parseInt(CFG.doorState.maxDoorsPerRefresh,10))||STATE_CHUNK));var chunks=[];for(var i=0;i<doors.length;i+=CH){chunks.push(doors.slice(i,i+CH));}
   $('btn-refresh-state').disabled=true;
-  setMsg('doors-msg','Reading the state of '+doors.length+' door(s)...');
-  return api('POST','/api/v1/doors/state',{doors:doors.map(slim)}).then(function(r){
-    (r.states||[]).forEach(function(x){setState(x.id,x.state,x.detail);});
-    setMsg('doors-msg','State of '+(r.states||[]).length+' door(s) read (request id '+r._rid+')','good');
-  }).catch(function(e){
-    doors.forEach(function(d){setState(d.id,'?',e.message);});
-    setMsg('doors-msg','State not read: '+errText(e),'bad');
-  }).then(function(){$('btn-refresh-state').disabled=false;});
+  setMsg('doors-msg','State '+done+' of '+total+' read');
+  var p=Promise.resolve();
+  chunks.forEach(function(ch){
+    p=p.then(function(){
+      if(gen!==READGEN||failed){return;}
+      return api('POST','/api/v1/doors/state',{doors:ch.map(slim)}).then(function(r){
+        if(gen!==READGEN){return;}
+        (r.states||[]).forEach(function(x){seen[x.id]=true;});
+        applyStates(r.states||[]);done+=ch.length;rid=r._rid;
+        if(done<total){setMsg('doors-msg','State '+done+' of '+total+' read');}
+      }).catch(function(e){if(gen===READGEN){failed=e;}});
+    });
+  });
+  return p.then(function(){
+    if(gen!==READGEN){return;}
+    $('btn-refresh-state').disabled=false;
+    if(failed){
+      applyStates(doors.filter(function(d){return !seen[d.id];}).map(function(d){return {id:d.id,state:'?',detail:failed.message};}));
+      setMsg('doors-msg','State not read: '+errText(failed),'bad');
+    }
+    else{setMsg('doors-msg','State of '+total+' door(s) read (request id '+rid+')','good');}
+  });
 }
-/* One action on many doors: one request, one socket session on the server (the page waits for the whole batch). */
+/* a few doors (after a door action): does not stop a bigger read that is running */
+function readSome(doors){
+  return api('POST','/api/v1/doors/state',{doors:doors.map(slim)}).then(function(r){applyStates(r.states||[]);}).catch(function(e){
+    applyStates(doors.map(function(d){return {id:d.id,state:'?',detail:e.message};}));setMsg('doors-msg','State not read: '+errText(e),'bad');
+  });
+}
+/* the doors on the shown page first, then the rest of the filtered list, then all the others */
+function readOrder(all){
+  var seen={},out=[];
+  function add(list){list.forEach(function(d){if(!seen[d.id]){seen[d.id]=true;out.push(d);}});}
+  add(PAGEROWS);add(visibleDoors());if(all){add(DOORS);}
+  return out;
+}
+/* A batch runs as a background job on the server (one per operator); the page follows its progress and takes the report at the end. */
+function followJob(id,total){
+  return new Promise(function(resolve,reject){
+    var box=$('job-bar');box.style.display='';
+    var n=0;
+    function paint(j){
+      $('job-text').textContent='Job '+id+': '+(j.phase||j.state)+' - '+j.done+' of '+j.total+' door(s)';
+      var p=$('job-progress');p.max=Math.max(1,j.total);p.value=j.done;
+    }
+    paint({phase:'Started',done:0,total:total,state:'queued'});
+    function tick(){
+      api('GET','/api/v1/jobs/'+id).then(function(j){
+        paint(j);
+        if(j.state==='done'){var res=j.result||{};res._rid=id;resolve(res);}
+        else if(j.state==='failed'){var e=new Error((j.error&&j.error.message)||'The job failed.');e.rid=id;e.code=(j.error&&j.error.code)||'';reject(e);}
+        else{n++;setTimeout(tick,n<10?400:1000);}
+      }).catch(reject);
+    }
+    tick();
+  });
+}
+/* One action on many doors: the server runs it as a job with the operator's own AEOS account. */
 function runBatch(a,doors,question,opts,meta){
   if(!doors.length||BATCH_BUSY){return;}
-  var names=doors.slice(0,5).map(function(d){return d.name;}).join(', ')+(doors.length>5?', ...':'');
+  var names=doors.slice(0,5).map(doorTitle).join(', ')+(doors.length>5?', ...':'');
   confirmDialog(question+' First '+Math.min(5,doors.length)+': '+names,opts).then(function(ok){
     if(!ok){return;}
     BATCH_BUSY=true;updateBatchBar();
@@ -3321,7 +5232,7 @@ function runBatch(a,doors,question,opts,meta){
     setMsg('doors-msg','Working on '+doors.length+' door(s)...');
     var req={action:a,doors:doors.map(slim)};
     if(meta&&meta.report){req.report=meta.report;}
-    return api('POST','/api/v1/doors/batch',req).then(function(r){
+    return api('POST','/api/v1/doors/batch',req).then(function(j){return followJob(j.jobId,doors.length);}).then(function(r){
       (r.results||[]).forEach(function(x){
         setRowResult(x.id,x.ok?'ok':'bad',x.ok?('OK (batch)'+(x.reply?(' reply: '+x.reply):'')+' request id '+r._rid):('FAILED: '+(x.fault||'no reply')+(x.refused?' (refused, not sent)':'')+' (request id '+r._rid+')'),r._rid);
         if(x.state!==undefined&&x.state!==null){setState(x.id,x.state,x.stateDetail);}
@@ -3334,10 +5245,51 @@ function runBatch(a,doors,question,opts,meta){
     }).then(function(){BATCH_BUSY=false;updateBatchBar();});
   });
 }
-$('btn-refresh-state').onclick=function(){refreshStates(visibleDoors());};
+/* ---- live states: GET /api/v1/doors/states?since=<version> every 3 s while the server account reads the door states ---- */
+function stopPolling(){if(POLL_TIMER){clearTimeout(POLL_TIMER);POLL_TIMER=null;}POLL_BUSY=false;POLL_GEN++;}function tickFresh(){if(!TIMED||!loggedIn()||!DOORS.length){return;}PAGEROWS.forEach(function(d){paintRowButtons(d.id);});updateBatchBar();}
+function startFreshTick(){if(!FRESH_TIMER){FRESH_TIMER=setInterval(tickFresh,2000);}}
+function startPolling(){stopPolling();VER=0;POLL_DELAY=3000;return pollStates(POLL_GEN);}
+function schedulePoll(g){if(g!==POLL_GEN){return;}POLL_TIMER=setTimeout(function(){pollStates(g);},POLL_DELAY);}
+/* a failing poll does not end live mode: it keeps trying with a longer pause (up to 30 s), says "paused", and resumes by itself */
+function pollPaused(why){
+  var was=LIVE;LIVE=false;POLL_DELAY=Math.min(30000,POLL_DELAY*2);
+  setMsg('doors-msg','Live states paused: '+why+' The page keeps trying; states older than '+FRESHSEC+' seconds switch the buttons off. Refresh state reads them with your own account.','bad');
+  if(was||true){PAGEROWS.forEach(function(d){paintRowButtons(d.id);});updateBatchBar();}
+}
+function pollStates(g){
+  if(g===undefined){g=POLL_GEN;}
+  if(!loggedIn()||!DOORS.length||POLL_BUSY){return Promise.resolve();}
+  POLL_BUSY=true;
+  return api('GET','/api/v1/doors/states?since='+VER).then(function(r){
+    POLL_BUSY=false;
+    if(g!==POLL_GEN){return;}
+    FRESHSEC=r.freshSeconds||FRESHSEC;
+    if(!r.account){
+      ACCT=false;LIVE=false;stopPolling();
+      setMsg('doors-msg','Live door states are not available now. Use Refresh state to read them.','bad');
+      DOORS.forEach(function(d){paintRowButtons(d.id);});updateBatchBar();
+      return;
+    }
+    ACCT=true;
+    if(!r.live){pollPaused('the server could not read the door states just now.');schedulePoll(g);return;}
+    if(!LIVE){setMsg('doors-msg','Live door states are back.','good');}
+    LIVE=true;VER=r.ver;POLL_DELAY=3000;
+    var known={};DOORS.forEach(function(d){known[d.id]=true;});
+    var list=[];
+    Object.keys(r.states||{}).forEach(function(id){if(known[id]){var x=r.states[id];list.push({id:id,state:x.state,detail:x.detail,ageSec:x.ageSec});}});
+    if(list.length){applyStates(list);}
+    else{PAGEROWS.forEach(function(d){paintRowButtons(d.id);});updateBatchBar();}
+    schedulePoll(g);
+  }).catch(function(e){
+    POLL_BUSY=false;
+    if(g!==POLL_GEN||(e&&e.cancelled)){return;}
+    if(e&&e.code==='session_expired'){return;}
+    pollPaused('the console cannot be reached.');schedulePoll(g);
+  });
+}$('btn-refresh-state').onclick=function(){if(LIVE){VER=0;pollStates(POLL_GEN);}else{refreshStates(readOrder(false));}};
 $('btn-arm').onclick=function(){var ds=selectedDoors();armRun('arm',ds,selScope(ds));};
 $('btn-disarm').onclick=function(){var ds=selectedDoors();armRun('disarm',ds,selScope(ds));};
-$('loc-filter-clear').onclick=function(){LOCFILTER='';renderDoors();};
+$('loc-filter-clear').onclick=function(){LOCFILTER='';renderDoors();saveMe();};
 $('arm-close').onclick=function(){ARMREP=null;$('arm-report').style.display='none';updateBatchBar();};
 $('arm-export').onclick=function(){
   if(!ARMREP||!ARMREP.file){return;}
@@ -3360,15 +5312,109 @@ $('btn-lockdown').onclick=function(){
 $('btn-load-doors').onclick=function(){
   setMsg('doors-msg','Loading...');
   api('GET','/api/v1/doors').then(function(r){
-    DOORS=r.doors||[];SEL={};STATES={};RES={};LOCFILTER='';PAGE=1;ARMREP=null;$('arm-report').style.display='none';renderDoors();updateLocTest();loadLicense();
+    READGEN++;stopPolling();
+    DOORS=r.doors||[];SEL={};STATES={};FRESH={};LAST=r.lastKnown||{};RES={};PAGE=1;ARMREP=null;$('arm-report').style.display='none';$('job-bar').style.display='none';
+    ACCT=!!r.account&&stateOn();TIMED=false;LIVE=ACCT&&!!r.live;FRESHSEC=r.freshSeconds||FRESHSEC;startFreshTick();
+    renderDoors();updateLocTest();loadLicense();
     if(r.ok){
-      setMsg('doors-msg',DOORS.length+' door(s) loaded (request id '+r._rid+')','good');
-      if(stateOn()&&DOORS.length){return refreshStates(visibleDoors());}
+      setMsg('doors-msg',DOORS.length+' door(s) loaded (request id '+r._rid+')'+(LIVE?'. The server reads the door states live.':''),'good');
+      if(ACCT&&DOORS.length){startPolling();}
+      if(stateOn()&&DOORS.length&&!LIVE){return refreshStates(readOrder(true));}
     }
     else{setMsg('doors-msg','AEOS answered with an error: '+(r.fault||('HTTP '+r.httpStatus))+' (request id '+r._rid+')','bad');}
-  }).catch(function(e){DOORS=[];LOCFILTER='';renderDoors();setMsg('doors-msg',errText(e),'bad');});
+  }).catch(function(e){DOORS=[];renderDoors();setMsg('doors-msg',errText(e),'bad');});
 };
-$('door-filter').oninput=renderDoors;
+$('door-filter').oninput=function(){renderDoors();saveMe();};
+
+/* ---- alias: edit in the table cell (admin), CSV import / export (Setup tab) ---- */
+function editAlias(td,d){
+  if(td.querySelector('input')){return;}
+  var cur=aliasOf(d),finished=false;
+  var inp=h('input',{type:'text','class':'alias-edit',maxlength:'200','data-id':d.id,'aria-label':'Alias of '+d.name});
+  inp.value=cur;td.textContent='';td.appendChild(inp);inp.focus();inp.select();
+  function cancel(){if(finished){return;}finished=true;td.textContent=cur;}
+  function save(){
+    if(finished){return;}
+    finished=true;
+    var v=inp.value.trim();
+    if(v===cur){td.textContent=cur;return;}
+    td.textContent='saving...';
+    api('PUT','/api/v1/aliases/'+encodeURIComponent(d.id),{alias:v}).then(function(r){
+      if(!CFG.aliases){CFG.aliases={};}
+      if(r.alias){CFG.aliases[d.id]=r.alias;}else{delete CFG.aliases[d.id];}
+      td.textContent=r.alias||'';
+      setMsg('doors-msg',r.alias?('Alias of '+d.name+' saved (request id '+r._rid+')'):('Alias of '+d.name+' removed (request id '+r._rid+')'),'good');
+    }).catch(function(e){td.textContent=cur;setMsg('doors-msg','Alias not saved: '+errText(e),'bad');});
+  }
+  inp.onkeydown=function(ev){
+    if(ev.key==='Escape'){ev.preventDefault();cancel();}
+    else if(ev.key==='Enter'){ev.preventDefault();save();}
+  };
+  inp.onblur=cancel;
+}
+function csvCell(v){
+  var t=String(v==null?'':v);
+  if(/^\s*[=+\-@\t\r]/.test(t)){t="'"+t;}
+  if(/[";\r\n]/.test(t)){t='"'+t.replace(/"/g,'""')+'"';}
+  return t;
+}
+function csvUnprotect(v){return /^'[=+\-@\t\r]/.test(v)?v.slice(1):v;}
+/* semicolon-separated, double quotes for cells with ; " or line breaks */
+function parseCsv(text){
+  text=text.replace(/^\uFEFF/,'');
+  var rows=[],row=[],cell='',q=false,i,c;
+  for(i=0;i<text.length;i++){
+    c=text.charAt(i);
+    if(q){
+      if(c==='"'){if(text.charAt(i+1)==='"'){cell+='"';i++;}else{q=false;}}
+      else{cell+=c;}
+    }
+    else if(c==='"'&&cell===''){q=true;}
+    else if(c===';'){row.push(cell);cell='';}
+    else if(c==='\n'||c==='\r'){
+      if(c==='\r'&&text.charAt(i+1)==='\n'){i++;}
+      row.push(cell);cell='';rows.push(row);row=[];
+    }
+    else{cell+=c;}
+  }
+  if(cell!==''||row.length){row.push(cell);rows.push(row);}
+  return rows.filter(function(r){return !(r.length===1&&r[0].trim()==='');});
+}
+$('btn-alias-export').onclick=function(){
+  if(!DOORS.length){setMsg('alias-msg','Load the doors first (Doors tab), then export.','bad');return;}
+  var lines=['id;name;alias'].concat(DOORS.map(function(d){return [d.id,d.name,aliasOf(d)].map(csvCell).join(';');}));
+  var u=URL.createObjectURL(new Blob([lines.join('\r\n')+'\r\n'],{type:'text/csv'}));
+  var a=h('a',{href:u,download:'doorkeeper-aliases.csv'});document.body.appendChild(a);a.click();a.remove();
+  setTimeout(function(){URL.revokeObjectURL(u);},5000);
+  setMsg('alias-msg',DOORS.length+' door(s) exported.','good');
+};
+$('btn-alias-import').onclick=function(){
+  var f=$('alias-file').files&&$('alias-file').files[0];
+  if(!f){setMsg('alias-msg','Choose the CSV file first.','bad');return;}
+  f.text().then(function(text){
+    var rows=parseCsv(text);
+    if(rows.length&&rows[0][0].trim().toLowerCase()==='id'){rows.shift();}
+    var ids={},byName={};
+    DOORS.forEach(function(d){ids[d.id]=d;(byName[d.name]=byName[d.name]||[]).push(d.id);});
+    var upd={},n=0,unknown=[],tooLong=0,bad=0;
+    rows.forEach(function(r){
+      if(r.length<2){bad++;return;}
+      var key=csvUnprotect(r[0].trim()),al=csvUnprotect((r.length>=3?r[2]:r[1]).trim()),id=null;
+      if(!DOORS.length||ids[key]){id=key;}
+      else if(byName[key]&&byName[key].length===1){id=byName[key][0];}
+      if(id===null){unknown.push(key);return;}
+      if(al.length>200){tooLong++;return;}
+      upd[id]=al;n++;
+    });
+    if(!n){setMsg('alias-msg','Nothing imported: '+unknown.length+' unknown door(s), '+bad+' bad line(s), '+tooLong+' too long.','bad');return;}
+    return api('PUT','/api/v1/aliases',{aliases:upd}).then(function(r){
+      if(!CFG.aliases){CFG.aliases={};}
+      Object.keys(upd).forEach(function(k){if(upd[k]){CFG.aliases[k]=upd[k];}else{delete CFG.aliases[k];}});
+      renderDoors();
+      setMsg('alias-msg','Imported '+n+' alias(es)'+(unknown.length?(', '+unknown.length+' unknown door(s) skipped (first: '+unknown.slice(0,3).join(', ')+')'):'')+(tooLong?(', '+tooLong+' too long skipped'):'')+(bad?(', '+bad+' bad line(s) skipped'):'')+' (request id '+r._rid+').','good');
+    });
+  }).catch(function(e){setMsg('alias-msg','Import failed: '+errText(e),'bad');});
+};
 
 /* ---- setup ---- */
 function fillOps(sel,current){
@@ -3616,13 +5662,17 @@ function fillSetup(){
   var k=CFG.socket;
   $('sk-host').value=k.host;$('sk-port').value=k.port;$('sk-terminator').value=k.terminator;$('sk-greetingWaitMs').value=k.greetingWaitMs;
   $('sk-replyTimeoutSec').value=k.replyTimeoutSec;$('sk-tls').checked=(k.tls!==false);$('sk-tlsSkipValidation').checked=!!k.tlsSkipValidation;
-  $('sk-loginTemplate').value=k.loginTemplate;$('sk-loginSuccessPattern').value=k.loginSuccessPattern;$('sk-initCommands').value=(k.initCommands||[]).join('\n');
+  $('sk-loginTemplate').value=k.loginTemplate;$('sk-loginSuccessPattern').value=k.loginSuccessPattern;paintPatternWarn();$('sk-initCommands').value=(k.initCommands||[]).join('\n');
   var ds=CFG.doorState||{};var dc=ds.checks||[];
   for(var i=1;i<=DS_ROWS;i++){var c=dc[i-1]||{};$('ds-label-'+i).value=c.label||'';$('ds-cmd-'+i).value=c.command||'';$('ds-match-'+i).value=c.matchPattern||'';}
   $('ds-otherwise').value=ds.otherwiseLabel||'';$('ds-max').value=ds.maxDoorsPerRefresh||500;
   var l=CFG.actions.listDoors;$('itemElement').value=l.itemElement;$('idField').value=l.idField;$('nameField').value=l.nameField;
   $('extraFields').value=(l.extraFields||[]).join(', ');$('pageSize').value=l.pageSize||0;
   fillLocations();
+  $('cfg-admins').value=((CFG.access&&CFG.access.admins)||[]).join('\n');
+  $('cfg-idleMinutes').value=(CFG.access&&CFG.access.idleMinutes)||15;
+  $('cfg-pollSeconds').value=(CFG.doorState&&CFG.doorState.pollSeconds)||30;
+  $('cfg-freshSeconds').value=(CFG.doorState&&CFG.doorState.freshSeconds)||120;
 }
 function readSetup(){
   var c=JSON.parse(JSON.stringify(CFG));
@@ -3645,19 +5695,21 @@ function readSetup(){
     var dl=$('ds-label-'+i).value.trim(),dm=$('ds-cmd-'+i).value.trim(),dp=$('ds-match-'+i).value.trim();
     if(dl||dm||dp){dchecks.push({label:dl,command:dm,matchPattern:dp});}
   }
-  c.doorState={checks:dchecks,otherwiseLabel:$('ds-otherwise').value.trim(),maxDoorsPerRefresh:parseInt($('ds-max').value,10)||500};
+  c.doorState={checks:dchecks,otherwiseLabel:$('ds-otherwise').value.trim(),maxDoorsPerRefresh:parseInt($('ds-max').value,10)||500,
+    pollSeconds:parseInt($('cfg-pollSeconds').value,10)||30,freshSeconds:parseInt($('cfg-freshSeconds').value,10)||120};
   var l=c.actions.listDoors;l.itemElement=$('itemElement').value.trim();l.idField=$('idField').value.trim();l.nameField=$('nameField').value.trim();
   l.extraFields=$('extraFields').value.split(',').map(function(s){return s.trim();}).filter(function(s){return s;});
   l.pageSize=parseInt($('pageSize').value,10)||0;
   c.locations=readLocations();
   c.groups=readGroups();
   c.arming={armAction:$('arm-action').value,disarmAction:$('disarm-action').value,armLabel:$('arm-label').value.trim(),disarmLabel:$('disarm-label').value.trim()};
+  c.access={admins:$('cfg-admins').value.split('\n').map(function(x){return x.trim();}).filter(function(x){return x;}),idleMinutes:parseInt($('cfg-idleMinutes').value,10)||15};
   return c;
 }
 /* Save what is on the Setup tab, then reload it from the server (header, banners, doors follow). */
 function saveSetup(){
   return api('PUT','/api/v1/config',readSetup()).then(function(r){
-    return api('GET','/api/v1/config').then(function(c){CFG=c;fillSetup();renderBanners();renderDoors();return loadLicense().then(function(){return r;});});
+    return api('GET','/api/v1/config').then(function(c){CFG=c;fillSetup();renderBanners();renderDoors();return loadLicense().then(function(){return api('GET','/api/v1/session');}).then(function(s){renderSession(s);loadServerAccount();return r;});});
   });
 }
 function byOpName(a,b){var x=a.name.toLowerCase(),y=b.name.toLowerCase();return x<y?-1:(x>y?1:0);}
@@ -3717,18 +5769,29 @@ $('btn-raw-socket-send').onclick=function(){
 };
 
 /* ---- audit ---- */
+function auditQuery(){
+  var p=[];
+  [['user','aud-user'],['door','aud-door'],['action','aud-action'],['from','aud-from'],['to','aud-to']].forEach(function(x){
+    var v=$(x[1]).value.trim();if(v&&v!=='all'){p.push(x[0]+'='+encodeURIComponent(v));}
+  });
+  return p;
+}
 function loadAudit(){
-  api('GET','/api/v1/audit?limit=50').then(function(r){
+  api('GET','/api/v1/audit?'+['limit=200'].concat(auditQuery()).join('&')).then(function(r){
     var b=$('audit-body');b.innerHTML='';
     (r.records||[]).slice().reverse().forEach(function(x){
-      b.appendChild(h('tr',null,[h('td',{text:x.ts}),h('td',{text:x.windowsUser}),h('td',{text:x.aeosUser}),h('td',{text:x.action+(x.batch?(' ['+x.batch+']'):'')}),
-        h('td',{text:(x.doorName||'')+' ('+(x.doorId||'')+')'}),h('td',{text:String(x.httpStatus)}),h('td',{text:x.ok?'yes':'NO'}),h('td',{text:x.fault||''})]));
+      b.appendChild(h('tr',null,[h('td',{text:x.ts}),h('td',{text:x.computer||''}),h('td',{text:x.windowsUser}),h('td',{text:x.aeosUser}),h('td',{text:x.action+(x.batch?(' ['+x.batch+']'):'')}),
+        h('td',{text:x.doorId?((x.doorName||'')+' ('+x.doorId+')'):(x.doorName||'')}),h('td',{text:x.doorAlias||''}),h('td',{text:String(x.httpStatus)}),h('td',{text:x.ok?'yes':'NO'}),h('td',{text:x.fault||''})]));
     });
     var c=$('audit-chain');c.textContent=r.chainOk?('Chain OK ('+r.total+' records)'):('CHAIN BROKEN at record '+(r.badIndex+1));
     c.className=r.chainOk?'msg good':'msg bad';setMsg('audit-msg','');
+    $('audit-count').textContent=(r.matched!==r.total)?(r.matched+' of '+r.total+' records match the filter'+(r.matched>(r.records||[]).length?(', the last '+(r.records||[]).length+' are shown'):'')):'';
   }).catch(function(e){setMsg('audit-msg',errText(e),'bad');});
 }
 $('btn-audit-refresh').onclick=loadAudit;
+$('btn-audit-export').onclick=function(){
+  download('/api/v1/audit/export'+(auditQuery().length?('?'+auditQuery().join('&')):''),'doorkeeper-audit.csv').catch(function(e){setMsg('audit-msg','Export failed: '+e.message,'bad');});
+};
 
 /* ---- debug ---- */
 function loadDebug(){
@@ -3752,14 +5815,45 @@ $('btn-diag').onclick=function(){
   }).catch(function(e){setMsg('debug-msg',errText(e),'bad');});
 };
 
+function paintPatternWarn(){$('sk-pattern-warn').style.display=$('sk-loginSuccessPattern').value.trim()?'none':'';}
+$('sk-loginSuccessPattern').oninput=paintPatternWarn;
+/* ---- server account (admin): set / replace / remove; the password is never read back ---- */
+function fmtTime(iso){if(!iso){return '';}var d=new Date(iso);return isNaN(d.getTime())?iso:d.toLocaleString();}
+function paintServerAccount(a){
+  var st=$('sa-status');
+  var txt=a.message||'';
+  if(a.set){txt='Set by '+a.setBy+' at '+fmtTime(a.setAt)+(a.lastLoginOkAt?(', last login OK at '+fmtTime(a.lastLoginOkAt)):', no successful login yet')+'. '+(a.state==='reenter'?'Server account must be entered again.':(a.state==='login-failed'?('The last read failed: '+(a.lastError||'')):''));}
+  st.textContent=txt;st.setAttribute('data-state',a.state||'none');
+  $('btn-sa-save').textContent=a.set?'Replace server account':'Set server account';
+  $('btn-sa-remove').disabled=!a.set;
+}
+function loadServerAccount(){
+  if(!isAdmin()){return Promise.resolve();}
+  return api('GET','/api/v1/server-account').then(paintServerAccount).catch(function(e){setMsg('sa-msg','Server account status not read: '+errText(e),'bad');});
+}
+$('btn-sa-save').onclick=function(){
+  var u=$('sa-user').value.trim(),p=$('sa-password').value;
+  if(!u||!p){setMsg('sa-msg','Enter the user name and the password.','bad');return;}
+  setMsg('sa-msg','Checking the account with AEOS...');
+  api('PUT','/api/v1/server-account',{user:u,password:p}).then(function(a){
+    $('sa-password').value='';$('sa-user').value='';paintServerAccount(a);setMsg('sa-msg','Server account saved. The password is stored encrypted and is not shown again.','good');
+  }).catch(function(e){$('sa-password').value='';setMsg('sa-msg','Not saved: '+errText(e),'bad');});
+};
+$('btn-sa-remove').onclick=function(){
+  confirmDialog('Remove the server account? Door states are then read only when an operator loads the doors.',{title:'Remove server account',ok:'Remove',danger:true}).then(function(ok){
+    if(!ok){return;}
+    api('DELETE','/api/v1/server-account').then(function(a){paintServerAccount(a);setMsg('sa-msg','Server account removed.','good');}).catch(function(e){setMsg('sa-msg','Not removed: '+errText(e),'bad');});
+  });
+};
+
 /* ---- start ---- */
 buildSetupActions();
 buildDoorStateSetup();
 buildLocationSetup();
-api('GET','/api/v1/config').then(function(c){
-  CFG=c;fillSetup();renderBanners();renderDoors();
-  return loadLicense().then(function(){return api('GET','/api/v1/session');});
-}).then(renderSession).catch(function(e){
+api('GET','/api/v1/session').then(function(s){
+  renderSession(s);
+  if(s.loggedIn||!s.behindProxy){return loadAll().then(function(){renderSession(s);return loadMe();});}
+}).catch(function(e){
   $('banners').appendChild(h('div',{class:'err',text:'Startup failed: '+errText(e)}));
 });
 })();
@@ -3772,6 +5866,68 @@ api('GET','/api/v1/config').then(function(c){
 # Main
 # ============================================================================
 
+function Start-PortRelay {
+    # IIS HttpPlatformHandler hands the child a port (%HTTP_PLATFORM_PORT%) and only accepts a child that listens on it with a plain
+    # TCP socket (a child that listens through HTTP.sys is answered 502.3 and restarted). This binds that port on 127.0.0.1 and
+    # copies every connection to DoorKeeper's own listener on -TargetPort, byte for byte, in both directions (nothing is parsed).
+    # At most -Max connections at a time; one side ending closes the other. Returns the relay object; throws when the port is taken.
+    param([int]$ListenPort, [int]$TargetPort, [int]$Max = 200)
+    if (-not ('DkRelay' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Net;
+using System.Net.Sockets;
+using System.Threading;
+public class DkRelay {
+    TcpListener listener; int target; int max; int active; volatile bool stopped;
+    public int Active { get { return active; } }
+    public DkRelay(int listenPort, int targetPort, int maxConnections) {
+        listener = new TcpListener(IPAddress.Loopback, listenPort); target = targetPort; max = maxConnections;
+    }
+    public void Start() {
+        listener.Start();
+        Thread t = new Thread(AcceptLoop); t.IsBackground = true; t.Start();
+    }
+    public void Stop() { stopped = true; try { listener.Stop(); } catch { } }
+    void AcceptLoop() {
+        while (!stopped) {
+            TcpClient c;
+            try { c = listener.AcceptTcpClient(); } catch { if (stopped) return; Thread.Sleep(50); continue; }
+            if (Interlocked.Increment(ref active) > max) { Interlocked.Decrement(ref active); try { c.Close(); } catch { } continue; }
+            TcpClient cc = c;
+            Thread h = new Thread(delegate() { Handle(cc); }); h.IsBackground = true; h.Start();
+        }
+    }
+    void Handle(TcpClient c) {
+        TcpClient u = null;
+        try {
+            u = new TcpClient(); u.NoDelay = true; c.NoDelay = true;
+            u.Connect(IPAddress.Loopback, target);
+            System.IO.Stream a = c.GetStream(); System.IO.Stream b = u.GetStream();
+            TcpClient cl = c, up = u;
+            Thread back = new Thread(delegate() { Pump(b, a, cl, up); }); back.IsBackground = true; back.Start();
+            Pump(a, b, c, u);
+            back.Join(5000);
+        } catch { }
+        finally {
+            try { c.Close(); } catch { }
+            try { if (u != null) u.Close(); } catch { }
+            Interlocked.Decrement(ref active);
+        }
+    }
+    static void Pump(System.IO.Stream from, System.IO.Stream to, TcpClient c, TcpClient u) {
+        byte[] buf = new byte[16384];
+        try { int n; while ((n = from.Read(buf, 0, buf.Length)) > 0) { to.Write(buf, 0, n); to.Flush(); } } catch { }
+        finally { try { c.Close(); } catch { } try { u.Close(); } catch { } }
+    }
+}
+'@
+    }
+    $relay = New-Object DkRelay($ListenPort, $TargetPort, $Max)
+    $relay.Start()
+    return $relay
+}
+
 function Start-Console {
     if (-not $ConfigFile) {
         $script:ConfigPath = Join-Path $script:ScriptDir 'doorkeeper.json'
@@ -3779,8 +5935,26 @@ function Start-Console {
         if (-not (Test-Path -LiteralPath $script:ConfigPath) -and (Test-Path -LiteralPath $oldCfg)) { $script:ConfigPath = $oldCfg }
     }
     else { $script:ConfigPath = [System.IO.Path]::GetFullPath($ConfigFile) }
-    $script:Port = $Port
+    # Behind the proxy DoorKeeper's own listener is on -InternalPort and -Port belongs to the relay.
+    $relayPort = $Port
+    $listenPort = $Port
+    if ($BehindProxy) { $listenPort = $InternalPort }
+    $script:Port = $listenPort
     $script:Cred = $null
+    $script:Sess = $null
+    $script:Sessions = @{}
+    $script:Jobs = [hashtable]::Synchronized(@{})
+    $script:LoginAttempts = @{}
+    $script:LogLock = New-Object System.Object
+    $script:RequestClient = $null
+    $script:PublicOrigin = ''
+    if ($script:BehindProxy) {
+        $script:PublicOrigin = Get-PublicOrigin -Url $PublicUrl
+        if (-not $script:PublicOrigin) {
+            Write-Host '-BehindProxy needs -PublicUrl with the address operators use, for example https://doorkeeper.example.org (http:// is accepted for localhost only).'
+            exit 1
+        }
+    }
     $script:DataDir = Split-Path -Parent $script:ConfigPath
     if ($LicenseFile) { $script:LicensePath = [System.IO.Path]::GetFullPath($LicenseFile) }
     else { $script:LicensePath = Join-Path $script:DataDir 'license.json' }
@@ -3794,9 +5968,29 @@ function Start-Console {
 
     $script:Config = Import-ConfigFile -Path $script:ConfigPath
     $problems = @(Test-ConfigObject $script:Config)
+    $script:DebugLogPath = Resolve-DataPath -Value ([string]$script:Config.debugLogFile) -BaseDir $script:ScriptDir -DefaultName 'doorkeeper-debug.log'
+    # One instance per data folder: two processes would break the audit hash chain and double the state polling.
+    # Behind IIS a recycle starts the new process before the old one has gone, so it waits a few seconds for the lock.
+    $lockWait = 0
+    if ($script:BehindProxy) { $lockWait = 8 }
+    $script:InstanceLock = Open-InstanceLock -Path (Join-Path $script:DataDir 'doorkeeper.lock') -WaitSeconds $lockWait
+    if ($null -eq $script:InstanceLock) {
+        $msg = 'Another DoorKeeper instance already uses the data folder ' + $script:DataDir + ' (lock file doorkeeper.lock). This instance stops.'
+        Write-DebugLog 'startup' $msg 'ERROR'
+        Write-Host $msg
+        exit 1
+    }
+    # Only the instance that holds the lock reads the head of the audit chain.
     Initialize-Paths
-    $url = 'http://localhost:' + $Port + '/'
+    $script:UsersPath = Join-Path $script:DataDir 'doorkeeper-users.json'
+    $script:StateCachePath = Join-Path $script:DataDir 'doorkeeper-state-cache.json'
+    $script:ServerAccountPath = Join-Path $script:DataDir 'doorkeeper-server-account.bin'
+    $script:ServerAccountMetaPath = Join-Path $script:DataDir 'doorkeeper-server-account.json'
+    Read-UserSettingsFile
+    Read-StateCacheFile
+    $url = 'http://localhost:' + $listenPort + '/'
     Write-StartupBlock -Url $url
+    if ($script:BehindProxy) { Write-DebugLog 'startup' ('Behind a proxy: public origin ' + $script:PublicOrigin + '; the client address is read from X-DK-Client-IP on requests from 127.0.0.1 only; relay on 127.0.0.1:' + $relayPort + ' -> ' + $InternalPort + '.') }
     foreach ($p in $problems) { Write-DebugLog 'startup' ('Config problem: ' + $p) 'WARN'; Write-Host ('Config problem: ' + $p) }
 
     $listener = New-Object System.Net.HttpListener
@@ -3805,8 +5999,31 @@ function Start-Console {
     catch {
         Write-DebugLog 'startup' ('Cannot listen on ' + $url + "`r`n" + (Format-ExceptionDetail $_.Exception)) 'ERROR'
         Write-Host ('Cannot listen on ' + $url + ': ' + $_.Exception.Message)
-        Write-Host 'Is another copy running? Use -Port to pick another port.'
+        Write-Host 'Is another copy running? Use -Port (or -InternalPort behind a proxy) to pick another port.'
         exit 1
+    }
+    # The live state poller: runs as soon as a server account is stored and can be decrypted. A stored account that cannot be
+    # decrypted (the identity changed) stops the poller and Setup shows "Server account must be entered again".
+    Initialize-TlsCallbackType
+    $script:Shared = New-SharedState
+    $script:ServerAccount = Read-ServerAccount -BlobPath $script:ServerAccountPath -MetaPath $script:ServerAccountMetaPath
+    if ($script:ServerAccount.present -and -not $script:ServerAccount.ok) {
+        Write-DebugLog 'startup' ('Server account: ' + $script:ServerAccount.error + ' It must be entered again on the Setup tab.') 'WARN'
+    }
+    Start-StatePoller
+    if ($script:ServerAccount.ok) { Set-PollerAccount -Cred $script:ServerAccount.cred; Write-DebugLog 'startup' 'Server account loaded; live state polling starts.' }
+    # Behind IIS: the port HttpPlatformHandler gave us is bound by a plain TCP relay to the listener above (the lock and the
+    # listener come first, so a second instance never gets this far).
+    $script:Relay = $null
+    if ($script:BehindProxy -and $relayPort -ne $InternalPort) {
+        try { $script:Relay = Start-PortRelay -ListenPort $relayPort -TargetPort $InternalPort -Max 200 }
+        catch {
+            Write-DebugLog 'startup' ('Cannot bind the relay port 127.0.0.1:' + $relayPort + "`r`n" + (Format-ExceptionDetail $_.Exception)) 'ERROR'
+            Write-Host ('Cannot bind the relay port 127.0.0.1:' + $relayPort + ': ' + $_.Exception.Message)
+            try { $listener.Stop() } catch { }
+            exit 1
+        }
+        Write-DebugLog 'startup' ('Relay: 127.0.0.1:' + $relayPort + ' -> 127.0.0.1:' + $InternalPort)
     }
     Write-Host ('DoorKeeper ' + $script:Version + ' listening on ' + $url + '  (Ctrl+C stops it)')
     Write-Host ('Config:    ' + $script:ConfigPath)
@@ -3816,14 +6033,19 @@ function Start-Console {
     try {
         while ($listener.IsListening) {
             $task = $listener.GetContextAsync()
-            while (-not $task.Wait(500)) { }
+            while (-not $task.Wait(500)) { try { Complete-FinishedJobs; Remove-ExpiredSessions } catch { } }
             Invoke-Request -Ctx $task.Result
+            try { Complete-FinishedJobs } catch { }
         }
     }
     finally {
         Write-DebugLog 'shutdown' 'Console stopping.'
+        Save-StateCache -MinAgeSec 0
+        Stop-StatePoller
+        if ($null -ne $script:Relay) { try { $script:Relay.Stop() } catch { } }
         $listener.Stop()
         $listener.Close()
+        if ($null -ne $script:InstanceLock) { try { $script:InstanceLock.Close() } catch { } }
     }
 }
 

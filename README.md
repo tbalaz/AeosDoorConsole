@@ -21,12 +21,13 @@ debug log, so when something does not work you can send that log back.
 powershell -ExecutionPolicy Bypass -File .\DoorKeeper.ps1
 ```
 
-Options: `-Port 8765` (default), `-ConfigFile <path>` (default `doorkeeper.json` next to the script, created on first
+Options: `-BehindProxy -PublicUrl https://<name>` (run behind IIS, see "Hosting on IIS"), `-Port 8765` (default), `-ConfigFile <path>` (default `doorkeeper.json` next to the script, created on first
 run; an existing `aeos-console.json` from an older version is used when `doorkeeper.json` is missing), `-NoBrowser` (do not open the browser). The page opens on `http://localhost:8765/`. Press Ctrl+C in the window
 to stop. Only this PC can reach the page.
 
 Files created next to the script: `doorkeeper.json` (your settings), `doorkeeper-audit.jsonl` (audit),
-`doorkeeper-debug.log` (debug log), `doorkeeper-diag-<time>.zip` (diagnostics, on request).
+`doorkeeper-debug.log` (debug log), `doorkeeper-diag-<time>.zip` (diagnostics, on request),
+`doorkeeper-users.json` (page settings per AEOS user), `doorkeeper-state-cache.json` (last known door states), `doorkeeper.lock` (single-instance lock) and, once a server account is set, `doorkeeper-server-account.bin` / `.json`.
 
 ## First-run setup on site
 
@@ -123,6 +124,178 @@ with `login rejected: <reply>`. An action with no command stays hidden (the *Nor
 The **Raw call** tab has a *Send socket command* box that runs the same session with one typed command and shows every
 line sent and received; it is written to the audit file like a door action.
 
+## Operators and admins
+
+Several people can use DoorKeeper, each logging in and out with his own AEOS account (every browser has its own session; on a single PC the page is served on this PC only, behind IIS see "Hosting on IIS"). **The password is checked at login.** With the socket interface set up (a login command that
+holds `{{password}}`) **and a non-empty *Login success pattern*** (an empty pattern is no check: any reply would pass), DoorKeeper opens one short socket session with only the login; the reply must match the pattern. Otherwise, when the *List doors* action is mapped, it makes one list doors call; **only an affirmative answer (HTTP 2xx and no SOAP fault) accepts the login**, any other status or a fault is a refusal. A refused login answers "AEOS refused the user or password", keeps nothing, and is written to the audit
+file (`login`, not OK, with the typed user name). While neither is set up yet (first setup) nothing can be checked and the
+login is accepted on the local console; **behind IIS (`-BehindProxy`) such a login is refused** (503 "AEOS login cannot be checked: set up the AEOS connection on the server first."). If AEOS cannot be reached, the login is refused with that reason: an admin who locked himself out this
+way edits `doorkeeper.json` (`"access": { "admins": [] }`) and restarts.
+
+- **Admin** = an AEOS user name in *Setup, Admins* (one per line, upper or lower case does not matter). **Operator** =
+  everybody else. An operator sees the Doors tab only (no Setup, Raw call, Audit, Debug) and can load doors, see states,
+  run actions, batch, Arm / Disarm and Lockdown, and change his own view (sort, rows per page, filter).
+- **First run:** (behind IIS the rule is different: with `-BehindProxy` an empty list gives nobody admin rights, see "Hosting on IIS".) While the admin list is empty every user is an admin and a red banner says so: "No admin is set: every user
+  can change settings. Add admins on the Setup tab." The first list needs a logged-in user and must hold his own name.
+- **Enforced on the server**, not only hidden: an operator (or a visitor who is not logged in once admins are set) gets HTTP
+  403 `forbidden_role` on saving the config (which also covers groups and map import), Load WSDL, both raw calls, the debug
+  log and diagnostics zip, the audit file and its export, license import and alias changes.
+- You cannot lock yourself out: the admin list cannot be emptied and must keep your own name (another admin can remove it).
+- "From where": every audit line records the **computer name** of the PC that runs DoorKeeper next to the Windows user and
+  the AEOS user. Reaching the console from other PCs (network listener, HTTPS, per-browser sessions) is not part of this
+  version; it would be a separate security change.
+
+## Hosting on IIS (many operators)
+
+DoorKeeper can run behind IIS so that many operators open one HTTPS address, for example
+`https://doorkeeper.example.org`, each in his own browser with his own AEOS login. IIS holds the HTTPS certificate and starts
+DoorKeeper through the Microsoft **HttpPlatformHandler** module; DoorKeeper still listens on `localhost` only, IIS is the only
+way in. HttpPlatformHandler cannot start a child that listens through HTTP.sys (it answers 502.3), so DoorKeeper binds the port
+HttpPlatformHandler gives it (`%HTTP_PLATFORM_PORT%`, option `-Port`) with a small built-in TCP relay on `127.0.0.1`, and the web
+listener itself runs on `http://localhost:<InternalPort>/` (option `-InternalPort`, default 8765). The relay copies each
+connection both ways and allows about 200 at a time. Without `-BehindProxy` nothing of this applies.
+
+**Status: lab-proven on IIS 10 (Windows Server 2025) with this README's `web.config`:** HttpPlatformHandler starts DoorKeeper
+directly (built-in relay), the `Host` rewrite, the handlers unlock, `loadUserProfile`, two operators at the same time, admin and
+operator roles, the client address in the audit, the server account (DPAPI, file ACL) and an app pool recycle. The Windows user
+is not available behind IIS.
+
+### What changes with `-BehindProxy`
+
+- **One session per browser.** The login creates a session: a random 32-byte id in the cookie `dk_session` (HttpOnly, Secure,
+  SameSite=Strict), its own page key (header `X-Console-Token`) and the AEOS credential of that user, kept in memory only.
+  Every role check and every AEOS call uses the credential of the session that asked. An operator who is idle for
+  `access.idleMinutes` (default 15) or has been logged in for 12 hours must log in again; logout ends the session at once.
+  A restart of DoorKeeper ends all sessions.
+- **Origin** must equal `-PublicUrl` exactly; **the client address** (header `X-DK-Client-IP`)
+  is read only on requests from `127.0.0.1`, and only this header, never `X-Forwarded-For`. Behind IIS every request comes from `127.0.0.1`, so a browser could send this header itself: the **URL Rewrite rule in the sample `web.config` is REQUIRED**, it overwrites it on every request. Without it the audit "from where" cannot be trusted. It goes into the audit. **The Windows user is not available behind IIS** (`{LOGON_USER}` is empty when the rule runs), so DoorKeeper does not read any such header and `windowsUser` in the audit stays empty.
+- **Door actions run with the operator's own AEOS account**, so the AEOS log names the operator too.
+- **Batch actions, Arm / Disarm and Lockdown run as background jobs** (one job per operator at a time); the page shows the
+  progress and the report at the end, so a long batch never blocks the other operators.
+- **Door lists per session.** Each session keeps the door ids of its own last successful *Load doors*; the live states and the door routes (state, action, batch) cover only those doors. Before a session has loaded doors it gets no states.
+- **Reports and jobs belong to their operator.** The arming report file name holds the job id and is created with CreateNew; only the operator of the job (or an admin) can read the job or download its report.
+- **Audit v4.** Every field of a line (the fault text too) is covered by its hash.
+- **Single instance.** DoorKeeper takes an exclusive lock on `doorkeeper.lock` in its data folder and stops with a clear message
+  when another instance holds it (two instances would break the audit hash chain and double the polling). After an IIS
+  recycle the new process waits up to 8 seconds for the old one to go.
+- **Login rate limit:** 5 failed logins in 5 minutes block that user from that address for 5 minutes (HTTP 429, audited as
+  `login-blocked`).
+- **Security headers** on every answer: `Content-Security-Policy` (the page: this site only; the API: nothing),
+  `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, `Cache-Control: no-store`.
+- **No admin until the file says so.** With `-BehindProxy` an empty `access.admins` list gives NOBODY admin rights: every
+  session is an operator and Setup changes are refused with 403 `forbidden_role`. (Without `-BehindProxy` the first-run rule
+  stays: while the list is empty every user is an admin.) The page shows: "No admin is set. An administrator of the server
+  must add AEOS user names to access.admins in the DoorKeeper config file and restart the site." So the first admin is set by
+  an administrator **on the server**: edit `doorkeeper.json` in the DoorKeeper folder, put the AEOS user name(s) into
+  `"access": { "admins": [ "<aeos user>" ] }`, save, and restart the app pool (IIS Manager, Application Pools, Recycle). The
+  admin can then add the other admins on the Setup tab.
+
+### Install steps
+
+0. **First setup on the server, without IIS:** run `DoorKeeper.ps1` on the server **without `-BehindProxy`** (as in "Run"), open `http://localhost:8765/` on the server itself, and do the first setup: the AEOS connection (URL, list doors, socket and its login command with a **login success pattern**), the Door state checks and the admin list. Stop it, then start the IIS site. Behind IIS no login is accepted until the AEOS connection can check it.
+1. **Server:** Windows Server with IIS, the HTTPS certificate of the customer bound to the site, the **HttpPlatformHandler**
+   module (Microsoft download, installed once). Windows PowerShell 5.1 is part of Windows.
+2. **Folder:** copy `DoorKeeper.ps1` to its own folder, for example `C:\DoorKeeper` (this is also the data folder: settings,
+   audit, debug log, lock file, server account). Give the app pool identity modify rights on it:
+   `icacls C:\DoorKeeper /grant "IIS AppPool\DoorKeeper:(OI)(CI)M"` and create `C:\DoorKeeper\logs`.
+3. **App pool** `DoorKeeper`: No Managed Code, identity **ApplicationPoolIdentity**, **load user profile = true** (DPAPI needs
+   it for the server account), start mode **AlwaysRunning**, idle time-out **0**, **overlapped recycle OFF**:
+   ```
+   appcmd add apppool /name:DoorKeeper /managedRuntimeVersion: /processModel.identityType:ApplicationPoolIdentity ^
+     /processModel.loadUserProfile:true /startMode:AlwaysRunning /processModel.idleTimeout:00:00:00 ^
+     /recycling.disallowOverlappingRotation:true
+   appcmd add site /name:DoorKeeper /physicalPath:C:\DoorKeeper /bindings:https/*:443:doorkeeper.example.org
+   appcmd set app "DoorKeeper/" /applicationPool:DoorKeeper
+   appcmd set site /site.name:DoorKeeper /applicationDefaults.preloadEnabled:true
+   ```
+   Bind the certificate to the https binding in IIS Manager (or by script:
+   `netsh http add sslcert ipport=0.0.0.0:443 certhash=<thumbprint> appid={<any GUID>}`). **Unlock the handlers section once** (it is locked by default, and
+   a `web.config` with a `<handlers>` entry is refused until then):
+   ```
+   appcmd unlock config -section:system.webServer/handlers
+   ```
+   `loadUserProfile:true` is needed for two things: DPAPI (the server account) and the C# compile (`Add-Type`) that DoorKeeper
+   does at start; with `false` both fail.
+4. **`web.config`** in `C:\DoorKeeper` (sample; replace the name and the paths):
+   ```xml
+   <?xml version="1.0" encoding="utf-8"?>
+   <configuration>
+     <system.webServer>
+       <handlers>
+         <add name="httpplatformhandler" path="*" verb="*" modules="httpPlatformHandler" resourceType="Unspecified" />
+       </handlers>
+       <httpPlatform processPath="C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+                     arguments="-NoProfile -ExecutionPolicy Bypass -File C:\DoorKeeper\DoorKeeper.ps1 -Port %HTTP_PLATFORM_PORT% -InternalPort 8765 -NoBrowser -BehindProxy -PublicUrl https://doorkeeper.example.org"
+                     processesPerApplication="1" startupTimeLimit="60" startupRetryCount="3" requestTimeout="00:05:00"
+                     stdoutLogEnabled="true" stdoutLogFile="C:\DoorKeeper\logs\httpplatform-stdout" />
+       <rewrite>
+         <rules>
+           <!-- REQUIRED: overwrites the client address header on EVERY request (a browser can send its own), and sets Host to what
+                the internal listener accepts: IIS forwards the public name, HTTP.sys answers 400 Invalid Hostname to it.
+                Keep localhost:8765 equal to -InternalPort above. -->
+           <rule name="DoorKeeper client info" stopProcessing="false">
+             <match url=".*" />
+             <serverVariables>
+               <set name="HTTP_X_DK_CLIENT_IP" value="{REMOTE_ADDR}" />
+               <set name="HTTP_HOST" value="localhost:8765" />
+             </serverVariables>
+             <action type="None" />
+           </rule>
+         </rules>
+       </rewrite>
+     </system.webServer>
+   </configuration>
+   ```
+   The rule needs the IIS **URL Rewrite** module and the two server variables allowed once for the site:
+   ```
+   appcmd set config "DoorKeeper" -section:system.webServer/rewrite/allowedServerVariables /+"[name='HTTP_X_DK_CLIENT_IP']" /commit:apphost
+   appcmd set config "DoorKeeper" -section:system.webServer/rewrite/allowedServerVariables /+"[name='HTTP_HOST']" /commit:apphost
+   ```
+   DoorKeeper does no parsing of `Host` itself. `-PublicUrl` must be exactly what the browser shows (scheme, name,
+   port if not 443), otherwise every request answers 403 "Origin not allowed".
+5. **First start:** open `https://doorkeeper.example.org/`, then follow "No admin until the file says so" above. Set the
+   server account (next section) and the settings of the Door state tab as on a single PC.
+
+**First request after a start (lab-proven):** after an app pool recycle or an IIS start the DoorKeeper process starts only on the
+first request, so the first page load takes a few seconds (the compile and the start) and live door states resume after it.
+A recycle keeps one instance (the lock file), the sessions end with it (operators log in again), and the audit chain stays valid.
+
+### Server account (live door states)
+
+An admin enters it once on Setup, **Live door states (server account)**: an AEOS user and password, checked against AEOS
+before they are kept. With it the console reads **all door states in the background** (a separate worker, never the
+request loop), in sessions of *Doors per socket session*, round after round with a pause of `doorState.pollSeconds`
+(default 30) between rounds, and a door that was just acted on is read again at once. The page asks for the changes since its
+last version every 3 seconds, so every operator sees the states **without pressing Load**. A door's buttons stay disabled
+until its state is fresher than `doorState.freshSeconds` (default 120), the rule "no action before a fresh state" stays.
+Without a server account the page reads the states itself when the operator loads the doors, as before.
+
+- **The server account only reads.** Every door action runs with the operator's own AEOS account. Create a **dedicated AEOS
+  user with the fewest rights** that allow the login and the state queries (`isLocked`, `isUnlocked`).
+- **Stored encrypted:** DPAPI, scope CurrentUser of the Windows account that runs DoorKeeper (the app pool identity), with
+  fixed entropy, in `doorkeeper-server-account.bin` in the data folder; the file's access list is the app pool identity and
+  Administrators only, inheritance off. Only DoorKeeper's own process can decrypt it. The password is never sent to a browser,
+  never logged and never audited; the page shows only "Set by <admin> at <time>, last login OK at <time>" and offers
+  Replace and Remove. Every change writes an audit line (`server-account-set`, `server-account-remove`).
+- If the stored account cannot be decrypted (for example the app pool identity was changed), Setup says **"Server account
+  must be entered again."**, the poller stays off and the console keeps working. Without `loadUserProfile=true` the store
+  fails: Setup says so.
+- Polling a large site loads AEOS: for 1893 doors one round is about 4 socket sessions of 500 doors; raise `pollSeconds` or
+  lower the session size if AEOS is busy. Measure on site.
+
+## Aliases (friendly door names)
+
+The AEOS id or name of a door is often cryptic. An **alias** is a friendly name for a door: the Doors table has an
+**Alias** column right after the checkbox, the filter box finds doors by alias too, and the confirm questions, the arming
+report CSV (`door_alias`) and the audit lines show it next to the name.
+
+- Admins edit an alias in place: click the Alias cell, type, **Enter** saves, **Esc** cancels. An empty text removes it.
+  Max 200 characters, no control characters.
+- **Setup, Aliases:** *Export doors as CSV* writes `id;name;alias` (semicolon separated, load the doors first); fill in the
+  alias column and *Import aliases*. A line may be `id;alias`, `name;alias` (when the id is not known and the name is
+  unique) or the three exported columns. Unknown doors are skipped and counted. Aliases are stored in `doorkeeper.json`
+  (`"aliases": { "<door id>": "<alias>" }`).
+
 ## Door state, selection and lockdown (Doors tab)
 
 **State column.** On the Setup tab, **Door state** section, you type up to four *checks*. Each check has a label, a
@@ -146,8 +319,28 @@ UNVERIFIED on site: `isLocked` answered `Response:false;` on a real AEOS 2023.2;
 `isUnlocked` query have not been tried yet. Try them with the **Raw call** tab socket box on a locked and an unlocked
 door first, and adjust the match patterns to what AEOS really answers.
 
-**Pages.** The table shows *Rows per page* doors (25, 50, 100, 250, 500 or All; default 100, remembered by the
-browser) with First / Previous / Next / Last above and below it and "Doors 1-100 of 1893, page 1 of 19". The pages
+**Fast status.** The rule stays: **a door's buttons stay off until the fresh state of this load is known**, and the batch
+buttons, Arm / Disarm and Lockdown stay off until every door they would touch has a fresh state. To make that quick:
+
+- *Load doors* paints the **last known states** at once, muted, with "last known HH:MM" in the tooltip (DoorKeeper keeps the
+  last state of every door in memory and in `doorkeeper-state-cache.json`). They only paint; they never switch a button on.
+- The page then reads the states in chunks of 100 doors (one socket session each): first the doors on the shown page, then
+  the rest of the filtered list, then all others. Every chunk paints as it arrives and switches on the buttons of its doors.
+  The progress text is "State 300 of 1893 read". A door whose read failed (`?`) stays off; *Refresh state* tries again.
+- For one door the state checks stop at the first match: a Locked door needs one command, not two.
+- No parallel socket sessions: it is not known whether AEOS allows them. Measure on site first.
+
+**Sorting.** Every column header except the checkbox and Actions sorts: first click ascending, second descending, third back
+to the list order; an arrow shows the order. Text sorts case-insensitive and natural (Gate 2 before Gate 10); State sorts by
+its label; location columns by their value; doors with an empty value come last. Sorting applies before paging, and a new
+sort goes to page 1.
+
+**Per user.** Rows per page, the sort, the last filter text and the selected location node are stored on the server per AEOS
+user (`doorkeeper-users.json`) and come back at the next login. When nobody is logged in the browser's own storage is used
+for the rows per page.
+
+**Pages.** The table shows *Rows per page* doors (25, 50, 100, 250, 500 or All; default 100, remembered per user) with
+First / Previous / Next / Last above and below it and "Doors 1-100 of 1893, page 1 of 19". The pages
 cover the doors the filter box and the location tree leave; a new filter, tree node or door list starts at page 1.
 
 **Selection and batch.** Every door row has a checkbox; the header checkbox selects the doors on
@@ -282,11 +475,11 @@ network unencrypted.
 
 ## Tabs
 
-- **Doors**: load, filter, and run the mapped actions. Each row shows the result and a **request id**. With locations set up: the location tree, door groups, Arm / Disarm and the arming report.
-- **Setup**: license, connection and mappings (above).
-- **Raw call**: send any request body to the service and see the response. Use this to explore the web service.
-- **Audit**: the last 50 door actions and whether the audit chain is intact.
-- **Debug**: live view of the debug log, download of the whole log, diagnostics zip.
+- **Doors** (everybody): load, filter, sort, and run the mapped actions. Each row shows the alias, the result and a **request id**. With locations set up: the location tree, door groups, Arm / Disarm and the arming report.
+- **Setup** (admins): license, admins, aliases, connection and mappings (above).
+- **Raw call** (admins): send any request body to the service and see the response. Use this to explore the web service.
+- **Audit** (admins): the last 200 matching audit lines with a filter and CSV export, and whether the audit chain is intact.
+- **Debug** (admins): live view of the debug log, download of the whole log, diagnostics zip.
 
 ## License and trial
 
@@ -329,14 +522,25 @@ When something fails, **send the debug log or the diagnostics zip to the integra
 
 ## Audit
 
-Every door action (success or failure) is appended to `doorkeeper-audit.jsonl` before the page gets its answer: time (UTC),
-Windows user, AEOS user, action, door, HTTP status, result and fault text. Each record carries the hash of the previous one
-(SHA-256 chain), so a changed or deleted line breaks the chain; the Audit tab shows "Chain OK" or "CHAIN BROKEN".
+Every door action (success or failure), every login (also a refused one) and every logout is appended to
+`doorkeeper-audit.jsonl` before the page gets its answer: time (UTC), the **computer** name, Windows user, AEOS user,
+action, door (id, name and **alias**), HTTP status, result and fault text. So the file answers who opened which door, when,
+and from which PC. Each record carries the hash of the previous one (SHA-256 chain), so a changed or deleted line breaks the
+chain; the Audit tab shows "Chain OK" or "CHAIN BROKEN". New lines have `"v":4` (older v1-v3 lines still verify) and the hash covers every field, among them the computer name,
+the alias and the **client address** (`clientIp`: the address IIS passed on; `windowsUser` stays empty behind IIS: the Windows user is not available there); older lines (v1, v2) keep their old hash and still verify. Server account changes (`server-account-set`,
+`server-account-remove`) and blocked logins (`login-blocked`) are audited too.
+
+The Audit tab (admins) filters by user (AEOS or Windows), door (name, alias or id), action (*Opened* = unlock or provide
+access, one action, login, logout) and UTC date range, and exports the matching lines as CSV
+(`time_utc,computer,client_ip,windows_user,aeos_user,action,door_id,door_name,door_alias,http_status,ok,fault,batch`). The chain check
+always covers the whole file, whatever the filter.
 
 ## Security notes
 
-- The page listens on `localhost` only. Every call from the page carries a random per-start token and the `Origin` is
-  checked, so another web page in your browser cannot trigger a door action through this port.
+- The page listens on `localhost` only. Every call from the page carries the page key of the session (a random per-start key before the
+  login) and the `Origin` is checked, so another web page in your browser cannot trigger a door action through this port.
+- The routes that take doors (state, action, batch) use only the door **id** from the page; name and extra come from the door
+  list the server read from AEOS itself. An id the server does not know is refused ("Load doors again").
 - No data is sent anywhere except to the AEOS URL you configured. No CDN, no telemetry.
 - Use HTTPS to the AEOS server. With plain `http://` the password travels unencrypted (the page warns).
 - Certificate validation is on unless you switch it off per the TLS step above.

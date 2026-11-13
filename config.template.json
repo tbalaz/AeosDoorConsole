@@ -32,9 +32,13 @@
   "doorState": {
     "checks": [],
     "otherwiseLabel": "",
-    "maxDoorsPerRefresh": 500
+    "maxDoorsPerRefresh": 500,
+    "pollSeconds": 30,
+    "freshSeconds": 120
   },
   "locations": { "levels": [], "rules": [], "map": {}, "labels": {} },
   "groups": [],
-  "arming": { "armAction": "lock", "disarmAction": "normal", "armLabel": "Arm", "disarmLabel": "Disarm" }
+  "arming": { "armAction": "lock", "disarmAction": "normal", "armLabel": "Arm", "disarmLabel": "Disarm" },
+  "access": { "admins": [], "idleMinutes": 15 },
+  "aliases": {}
 }
