@@ -1,0 +1,48 @@
+{
+  "aeosUrl": "",
+  "wsdlUrl": "",
+  "soapVersion": "1.1",
+  "auth": "basic",
+  "tlsSkipValidation": true,
+  "timeoutSec": 30,
+  "namespacePrefix": "aeos",
+  "targetNamespace": "http://www.nedap.com/aeosws",
+  "auditFile": "",
+  "debugLogFile": "",
+  "debugLevel": "full",
+  "socket": {
+    "host": "",
+    "port": 8035,
+    "tls": true,
+    "tlsSkipValidation": true,
+    "terminator": "CRLF",
+    "greetingWaitMs": 2000,
+    "loginTemplate": "login({{user}},{{password}});",
+    "loginSuccessPattern": "^Response:true;",
+    "initCommands": ["setRmiCommandConnection(true);"],
+    "replyTimeoutSec": 10
+  },
+  "doorState": {
+    "checks": [
+      { "label": "Locked",   "command": "execute(isLocked,\"{{HostName}}:{{name}}\");",   "matchPattern": "^Response:true;" },
+      { "label": "Unlocked", "command": "execute(isUnlocked,\"{{HostName}}:{{name}}\");", "matchPattern": "^Response:true;" }
+    ],
+    "otherwiseLabel": "Normal",
+    "maxDoorsPerRefresh": 500
+  },
+  "actions": {
+    "listDoors": {
+      "operation": "findAccessPoint",
+      "soapAction": "",
+      "body": "<{{ns}}:AccessPointSearchInfo><{{ns}}:AccessPointInfo/><{{ns}}:SearchRange><{{ns}}:startRecordNo>0</{{ns}}:startRecordNo><{{ns}}:nrOfRecords>500</{{ns}}:nrOfRecords></{{ns}}:SearchRange></{{ns}}:AccessPointSearchInfo>",
+      "itemElement": "AccessPoint",
+      "idField": "Id",
+      "nameField": "Name",
+      "extraFields": ["HostName"]
+    },
+    "lock":   { "label": "Lock",           "transport": "socket", "operation": "", "soapAction": "", "body": "", "command": "execute(lock,\"{{HostName}}:{{name}}\");",          "successPattern": "^Response:", "confirm": true },
+    "unlock": { "label": "Unlock",         "transport": "socket", "operation": "", "soapAction": "", "body": "", "command": "execute(unlock,\"{{HostName}}:{{name}}\");",        "successPattern": "^Response:", "confirm": true },
+    "access": { "label": "Provide access", "transport": "socket", "operation": "", "soapAction": "", "body": "", "command": "execute(provideAccess,\"{{HostName}}:{{name}}\");", "successPattern": "^Response:", "confirm": true },
+    "normal": { "label": "Normal",         "transport": "socket", "operation": "", "soapAction": "", "body": "", "command": "execute(normal,\"{{HostName}}:{{name}}\");",        "successPattern": "^Response:", "confirm": true }
+  }
+}

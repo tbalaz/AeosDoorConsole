@@ -97,6 +97,10 @@ log under the request id with control characters shown (`<CR>` `<LF>`); the logi
 | Success pattern (each action) | `^Response:` |
 | List doors | SOAP: operation `findAccessPoint`, Door element `AccessPoint`, Id field `Id`, Name field `Name`, Extra columns `HostName` (confirm with *Test list*) |
 
+Ready-made settings with all the values above, the door list request and the two door state checks:
+`examples/aeos-2023.2/doorkeeper.json`. Stop DoorKeeper (Ctrl+C), copy that file next to `DoorKeeper.ps1` (it replaces
+the settings there), start DoorKeeper, type the AEOS URL on the Setup tab, Save, then *Test list*.
+
 Command placeholders: `{{id}}`, `{{name}}` and `{{<extra column>}}` (any extra column of the door list, for example
 `{{HostName}}`); `{{user}}` and `{{password}}` work in the login command only. Values are not escaped: a door value
 holding a line break, a double quote or a semicolon (and a user name or password also a comma or a closing
