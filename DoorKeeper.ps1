@@ -2443,7 +2443,8 @@ button.primary{background:var(--blue-deep);color:#fff;border:none;font-weight:60
 button.act{margin-right:6px;height:30px;padding:0 10px;font-size:13px}
 .pager{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:8px 0;font-size:13px}
 .pager button{height:30px;padding:0 10px;font-size:13px}
-.pager select{height:30px}
+.pager select{height:30px;padding:0 6px;font-size:13px}
+.pager label{display:inline-flex;align-items:center;gap:6px;margin:0}
 .pager button.pg-link{border:none;background:none;color:var(--blue-dark);text-decoration:underline;padding:0 4px}
 button:disabled{opacity:.5;cursor:default}
 button svg{vertical-align:-3px;margin-right:6px}
