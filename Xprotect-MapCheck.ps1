@@ -10,6 +10,14 @@
     that Smart Map is used as well). Nothing is changed on the server.
 
     Floor plans are sensitive: images are saved only with -SaveImages <folder>, and only into that folder.
+    -ItemsFile <file> writes every placed item as one JSON line (map, map id, type, and the item as the server returns
+    it, with its position fields), to find which item type the doors are and where they sit on each floor plan.
+    -Find <text> prints every placed item whose name contains that text, with its map and type, and every map whose
+    definition holds the text (doors placed from an access control system can live only there).
+    -DumpMap <map name> writes the definition of the first map whose name contains that text to -DumpFile
+    (default mapdump.xml), picture data removed, to see how its items are stored.
+    Login: when IDP/connect/token answers 401 for a valid account, try another name of the same server (short name,
+    full name): on one site one name answered 401 and another one worked.
     The maps part of the REST API is not documented by Milestone (it works in the XProtect REST API Gateway); item
     type ids come from Milestone's own client code. Unknown item types are listed with sample names.
 
@@ -22,7 +30,11 @@ param(
     [System.Management.Automation.PSCredential]$Credential = $null,
     [string]$SaveImages = '',
     [switch]$SkipCertCheck,
-    [string]$Out = ''
+    [string]$Out = '',
+    [string]$ItemsFile = '',
+    [string]$Find = '',
+    [string]$DumpMap = '',
+    [string]$DumpFile = 'mapdump.xml'
 )
 $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -45,6 +57,20 @@ function Get-SafeImagePath {
     $target = [IO.Path]::GetFullPath((Join-Path $dir ($safe + '_' + $g.ToString() + $Ext)))
     if (-not $target.StartsWith($dir, [StringComparison]::OrdinalIgnoreCase)) { return $null }
     return $target
+}
+
+function Remove-ImageData {
+    # The map definition without its picture: every long base64 element body is replaced by a short note.
+    param([string]$Xml)
+    if (-not $Xml) { return '' }
+    $ev = [System.Text.RegularExpressions.MatchEvaluator]{ param($m) '>[base64 data removed: ' + $m.Groups[1].Value.Length + ' characters]<' }
+    return [regex]::Replace($Xml, '>([A-Za-z0-9+/=\s]{200,})<', $ev)
+}
+
+function New-ItemLine {
+    # One placed item as one JSON line: the map it is on, its type and the item exactly as the server returned it.
+    param([string]$MapName, [string]$MapId, [string]$Type, $Item)
+    return (ConvertTo-Json -Compress -Depth 8 -InputObject ([ordered]@{ map = $MapName; mapId = $MapId; type = $Type; item = $Item }))
 }
 
 # Login: IDP token with the Windows login (NTLM / Kerberos), read-only from here on.
@@ -74,6 +100,9 @@ Say ('Classic maps: ' + $maps.Count)
 $info = @{}
 $typeCount = @{}
 $other = @{}
+$itemLines = New-Object System.Collections.Generic.List[string]
+$found = New-Object System.Collections.Generic.List[string]
+$dumped = ''
 foreach ($m in $maps) {
     $id = $m.relations.self.id
     $d = Get-Api ('maps/' + $id + '?include=displayXml')
@@ -102,6 +131,16 @@ foreach ($m in $maps) {
         $cnt[$t] = 1 + [int]$cnt[$t]; $typeCount[$t] = 1 + [int]$typeCount[$t]
         if ($t -eq 'hotzone' -and $v.relations.related) { $links += [string]$v.relations.related.id }
         if ($t -like 'other:*') { if (-not $other[$t]) { $other[$t] = New-Object System.Collections.Generic.List[string] }; if ($other[$t].Count -lt 5) { $other[$t].Add([string]$v.name) } }
+        if ($ItemsFile) { $itemLines.Add((New-ItemLine -MapName ([string]$m.name) -MapId ([string]$id) -Type $t -Item $v)) }
+        if ($Find -and ([string]$v.name).IndexOf($Find, [StringComparison]::OrdinalIgnoreCase) -ge 0) { $found.Add(('  ' + $v.name + '  [' + $t + ']  on map: ' + $m.name)) }
+    }
+    # Items such as access control doors can live only in the map definition, not in the visual items list.
+    if ($Find -and $dx.IndexOf($Find, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+        $found.Add(('  "' + $Find + '" is in the map definition of: ' + $m.name + ' (' + ([regex]::Matches($dx, [regex]::Escape($Find), 'IgnoreCase')).Count + ' times)'))
+    }
+    if ($DumpMap -and -not $dumped -and ([string]$m.name).IndexOf($DumpMap, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+        [IO.File]::WriteAllText($DumpFile, (Remove-ImageData $dx))
+        $dumped = [string]$m.name
     }
     $info[$id] = [pscustomobject]@{ Name = $m.name; Image = $imgNote; Counts = $cnt; Links = $links; ItemsError = $vi.__error }
 }
@@ -132,6 +171,13 @@ else {
     $all = Get-Items $cams
     $pos = @($all | Where-Object { $_.gisPoint -and [string]$_.gisPoint -notmatch 'EMPTY' }).Count
     Say ''; Say ('Cameras: ' + $all.Count + ', with a Smart Map position: ' + $pos + $(if ($pos -gt 0) { '  (Smart Map is used for these)' } else { '' }))
+}
+if ($Find) { Say ''; Say ('Items whose name contains "' + $Find + '": ' + $found.Count); foreach ($f in $found) { Say $f } }
+if ($ItemsFile) { [IO.File]::WriteAllLines($ItemsFile, $itemLines); Say ''; Say ('Items file: ' + $ItemsFile + ' (' + $itemLines.Count + ' items)') }
+if ($DumpMap) {
+    Say ''
+    if ($dumped) { Say ('Map definition of "' + $dumped + '" (picture data removed) written to: ' + $DumpFile) }
+    else { Say ('No map name contains "' + $DumpMap + '": nothing written.') }
 }
 if ($SaveImages) { Say ('Images saved to: ' + $SaveImages) }
 if ($Out) { [IO.File]::WriteAllLines($Out, $lines) ; Write-Host ('Report: ' + $Out) }

@@ -228,7 +228,17 @@ powershell -ExecutionPolicy Bypass -File .\Xprotect-MapCheck.ps1 -ManagementServ
 ```
 
 Add `-SkipCertCheck` when the server certificate is not trusted on this PC. The maps part of the XProtect REST API is
-not documented by Milestone; a later XProtect version may change it.
+not documented by Milestone; a later XProtect version may change it. When `/IDP/connect/token` answers 401 for a valid
+account, try another name of the same server (short name, full name): on one site one name answered 401 and another
+worked.
+
+- `-Find <text>` prints every placed item whose name contains the text, with its map and type (for example a door name
+  from the DoorKeeper list, to see which item type the doors are), and every map whose definition holds the text: on
+  site, doors that Smart Client shows and controls on a floor plan were not in the maps API's item list.
+- `-DumpMap <map name>` writes the definition of the first map whose name contains the text to `-DumpFile` (default
+  `mapdump.xml`), picture data removed, to see how its items (doors included) are stored and positioned.
+- `-ItemsFile items.jsonl` writes every placed item as one JSON line: map, map id, type and the item as the server
+  returns it, position fields included. Like the floor plans, this file describes the site: keep it there.
 
 ## Finding the right operations: Aeos-WsdlHelper.ps1
 
