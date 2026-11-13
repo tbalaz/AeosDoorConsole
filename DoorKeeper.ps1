@@ -556,7 +556,7 @@ function Get-DefaultConfigJson {
     "replyTimeoutSec": 10
   },
   "actions": {
-    "listDoors": { "operation": "", "soapAction": "", "body": "", "itemElement": "", "idField": "", "nameField": "", "extraFields": [] },
+    "listDoors": { "operation": "", "soapAction": "", "body": "", "itemElement": "", "idField": "", "nameField": "", "extraFields": [], "pageSize": 0 },
     "lock":   { "label": "Lock",           "transport": "soap", "operation": "", "soapAction": "", "body": "", "command": "", "successPattern": "", "confirm": true },
     "unlock": { "label": "Unlock",         "transport": "soap", "operation": "", "soapAction": "", "body": "", "command": "", "successPattern": "", "confirm": true },
     "access": { "label": "Provide access", "transport": "soap", "operation": "", "soapAction": "", "body": "", "command": "", "successPattern": "", "confirm": true },
@@ -566,13 +566,16 @@ function Get-DefaultConfigJson {
     "checks": [],
     "otherwiseLabel": "",
     "maxDoorsPerRefresh": 500
-  }
+  },
+  "locations": { "levels": [], "rules": [], "map": {}, "labels": {} },
+  "groups": [],
+  "arming": { "armAction": "lock", "disarmAction": "normal", "armLabel": "Arm", "disarmLabel": "Disarm" }
 }
 '@
 }
 
 function Merge-Config {
-    # Default keys only; loaded values win; arrays stay arrays; unknown keys are dropped.
+    # Default keys only; loaded values win; arrays stay arrays; unknown keys are dropped (an empty default object keeps every loaded key).
     param($Default, $Loaded)
     $out = [ordered]@{}
     foreach ($p in $Default.PSObject.Properties) {
@@ -584,7 +587,11 @@ function Merge-Config {
             $lp = $Loaded.PSObject.Properties[$name]
             if ($lp) { $has = $true; $lv = $lp.Value }
         }
-        if ($dv -is [System.Management.Automation.PSCustomObject]) {
+        if ($dv -is [System.Management.Automation.PSCustomObject] -and @($dv.PSObject.Properties).Count -eq 0) {
+            # an empty default object is a free-form map (locations.map, locations.labels): the loaded keys stay
+            if ($has -and $lv -is [System.Management.Automation.PSCustomObject]) { $out[$name] = $lv } else { $out[$name] = $dv }
+        }
+        elseif ($dv -is [System.Management.Automation.PSCustomObject]) {
             $sub = $null
             if ($has) { $sub = $lv }
             $out[$name] = Merge-Config $dv $sub
@@ -689,8 +696,197 @@ function Test-ConfigObject {
         foreach ($f in @($ld.extraFields)) {
             if ($f -and ([string]$f) -notmatch $ncname) { $errs.Add('actions.listDoors.extraFields entries must be plain XML element names.') }
         }
+        $ps = 0
+        if (-not [int]::TryParse([string]$ld.pageSize, [ref]$ps) -or $ps -lt 0 -or $ps -gt 100000) { $errs.Add('actions.listDoors.pageSize must be a whole number from 0 to 100000 (0 = one request).') }
+        elseif ($ps -lt 1 -and ([string]$ld.body).Contains('{{start}}')) { $errs.Add('The list doors body uses {{start}}: set the page size (1-100000).') }
+    }
+    $lc = $Config.locations
+    if ($null -ne $lc) {
+        $seenLv = @{}
+        foreach ($lv in @($lc.levels)) {
+            $n = [string]$lv
+            if ($n -notmatch '^[A-Za-z_][A-Za-z0-9_]*$') { $errs.Add('locations.levels: "' + $n + '" must be a plain name (letters, digits, _) because it is also a regex group name.'); continue }
+            if ($seenLv.ContainsKey($n)) { $errs.Add('locations.levels: "' + $n + '" is listed twice.'); continue }
+            $seenLv[$n] = $true
+        }
+        $ri = 0
+        foreach ($r in @($lc.rules)) {
+            $ri++
+            if ($null -eq $r) { continue }
+            if ([string]$r.source -notmatch $ncname) { $errs.Add('locations.rules[' + $ri + '].source must be name, id or the name of an extra column.') }
+            $pat = [string]$r.pattern
+            if (-not $pat) { $errs.Add('locations.rules[' + $ri + '] needs a pattern.') }
+            else {
+                $pe = Get-RegexError $pat
+                if ($pe) { $errs.Add('locations.rules[' + $ri + '].pattern is not a valid regular expression: ' + $pe) }
+                elseif ($pat -notmatch '\(\?<[A-Za-z_]') { $errs.Add('locations.rules[' + $ri + '].pattern needs at least one named group such as (?<city>[A-Z]+).') }
+            }
+        }
+        if ($null -ne $lc.map) {
+            if ($lc.map -isnot [System.Management.Automation.PSCustomObject]) { $errs.Add('locations.map must be an object of key -> { level: value }.') }
+            else { foreach ($mp in $lc.map.PSObject.Properties) { if ($mp.Value -isnot [System.Management.Automation.PSCustomObject]) { $errs.Add('locations.map["' + $mp.Name + '"] must be an object of level -> value.') } } }
+        }
+        if ($null -ne $lc.labels -and $lc.labels -isnot [System.Management.Automation.PSCustomObject]) { $errs.Add('locations.labels must be an object of value -> display name.') }
+    }
+    $gi = 0
+    $gseen = @{}
+    foreach ($g in @($Config.groups)) {
+        $gi++
+        if ($null -eq $g) { continue }
+        $gn = ([string]$g.name).Trim()
+        if (-not $gn) { $errs.Add('groups[' + $gi + '] needs a name.') }
+        elseif ($gseen.ContainsKey($gn.ToLowerInvariant())) { $errs.Add('groups: the name "' + $gn + '" is used twice.') }
+        else { $gseen[$gn.ToLowerInvariant()] = $true }
+        if ($null -ne $g.match -and $g.match -isnot [System.Management.Automation.PSCustomObject]) { $errs.Add('groups[' + $gi + '].match must be an object of level -> list of values.') }
+    }
+    $ar = $Config.arming
+    if ($null -ne $ar) {
+        foreach ($k in @('armAction', 'disarmAction')) {
+            if (@('lock', 'unlock', 'access', 'normal') -notcontains [string]$ar.$k) { $errs.Add('arming.' + $k + ' must be lock, unlock, access or normal.') }
+        }
+        foreach ($k in @('armLabel', 'disarmLabel')) {
+            if (-not ([string]$ar.$k).Trim()) { $errs.Add('arming.' + $k + ' must not be empty.') }
+        }
     }
     return $errs.ToArray()
+}
+
+# ============================================================================
+# Locations, door groups, arming report (the page carries a JS twin of placeDoor / doorInGroup; tests\fixtures\locations.json
+# feeds both and must give the same result)
+# ============================================================================
+
+function Get-JsonProp {
+    # Property or key of a parsed-JSON object or a dictionary; $null when missing.
+    param($Obj, [string]$Name)
+    if ($null -eq $Obj) { return $null }
+    if ($Obj -is [System.Collections.IDictionary]) { if ($Obj.Contains($Name)) { return $Obj[$Name] } else { return $null } }
+    $p = $Obj.PSObject.Properties[$Name]
+    if ($p) { return $p.Value }
+    return $null
+}
+
+function Get-DoorLocation {
+    # Places one door. $Door has id, name, extra. $Locations = the config object { levels, rules, map, labels }.
+    # Rules in order, the first rule whose source value matches wins; every named group with a value becomes a field.
+    # Then the map overrides: the first of id, name, extra values (in order) that is a key of the map; its values replace fields.
+    # Path = the level values in order up to the first level without a value; no value for the first level = unplaced.
+    param($Door, $Locations)
+    $fields = [ordered]@{}
+    $ruleNo = 0
+    $levels = @()
+    if ($null -ne $Locations) { $levels = @(@($Locations.levels) | Where-Object { $null -ne $_ -and [string]$_ } | ForEach-Object { [string]$_ }) }
+    $extra = $null
+    if ($null -ne $Door) { $extra = Get-JsonProp $Door 'extra' }
+    $extraValues = @()
+    if ($extra -is [System.Collections.IDictionary]) { foreach ($k in $extra.Keys) { $extraValues += [string]$extra[$k] } }
+    elseif ($null -ne $extra) { foreach ($p in $extra.PSObject.Properties) { $extraValues += [string]$p.Value } }
+    if ($null -ne $Locations -and $null -ne $Door) {
+        $i = 0
+        foreach ($r in @($Locations.rules)) {
+            $i++
+            if ($null -eq $r) { continue }
+            $src = [string]$r.source
+            $val = ''
+            if ($src -ceq 'name') { $val = [string]$Door.name }
+            elseif ($src -ceq 'id') { $val = [string]$Door.id }
+            else { $val = [string](Get-JsonProp $extra $src) }
+            if (-not $val -or -not [string]$r.pattern) { continue }
+            $re = $null
+            try { $re = New-Object System.Text.RegularExpressions.Regex([string]$r.pattern) } catch { continue }
+            $m = $re.Match($val)
+            if (-not $m.Success) { continue }
+            foreach ($gn in $re.GetGroupNames()) {
+                if ($gn -match '^\d+$') { continue }
+                $g = $m.Groups[$gn]
+                if ($g.Success -and $g.Value) { $fields[$gn] = $g.Value }
+            }
+            $ruleNo = $i
+            break
+        }
+        $keys = @([string]$Door.id, [string]$Door.name) + $extraValues
+        $map = $Locations.map
+        if ($null -ne $map) {
+            foreach ($k in $keys) {
+                if (-not $k) { continue }
+                $entry = Get-JsonProp $map $k
+                if ($null -eq $entry) { continue }
+                $props = @()
+                if ($entry -is [System.Collections.IDictionary]) { foreach ($ek in $entry.Keys) { $props += , @([string]$ek, [string]$entry[$ek]) } }
+                else { foreach ($ep in $entry.PSObject.Properties) { $props += , @([string]$ep.Name, [string]$ep.Value) } }
+                foreach ($pv in $props) { if ($pv[1]) { $fields[$pv[0]] = $pv[1] } }
+                break
+            }
+        }
+    }
+    $path = @()
+    foreach ($lv in $levels) {
+        if ($fields.Contains($lv) -and [string]$fields[$lv]) { $path += [string]$fields[$lv] } else { break }
+    }
+    $text = '(unplaced)'
+    if ($path.Count -gt 0) { $text = ($path -join '/') }
+    return [pscustomobject]@{ Fields = $fields; Path = @($path); Placed = ($path.Count -gt 0); Text = $text; Rule = $ruleNo }
+}
+
+function Test-DoorInGroup {
+    # A door is in the group when it matches EVERY level listed in group.match (OR within a level's values) OR its id
+    # is in group.doorIds. A group with no usable level and no id matches nothing. $Location = the Get-DoorLocation result.
+    param($Door, $Location, $Group)
+    if ($null -eq $Group) { return $false }
+    $id = [string]$Door.id
+    foreach ($x in @($Group.doorIds)) { if ($null -ne $x -and [string]$x -ceq $id) { return $true } }
+    $m = Get-JsonProp $Group 'match'
+    if ($null -eq $m) { return $false }
+    $used = 0
+    $all = $true
+    $props = @()
+    if ($m -is [System.Collections.IDictionary]) { foreach ($k in $m.Keys) { $props += , @([string]$k, $m[$k]) } }
+    else { foreach ($p in $m.PSObject.Properties) { $props += , @([string]$p.Name, $p.Value) } }
+    foreach ($pv in $props) {
+        $vals = @(@($pv[1]) | Where-Object { $null -ne $_ -and [string]$_ } | ForEach-Object { [string]$_ })
+        if ($vals.Count -eq 0) { continue }
+        $used++
+        $have = ''
+        if ($Location.Fields.Contains($pv[0])) { $have = [string]$Location.Fields[$pv[0]] }
+        if ($vals -cnotcontains $have) { $all = $false }
+    }
+    return ($used -gt 0 -and $all)
+}
+
+function ConvertTo-CsvCell {
+    # One CSV cell: quoted when needed. A cell that starts with = + - @ TAB or CR, also after leading spaces, gets a '
+    # in front, so a spreadsheet does not run it as a formula (spreadsheets skip the leading whitespace).
+    param($Value)
+    $t = [string]$Value
+    if ($t -match '^[\s]*[=+\-@\t\r]') { $t = "'" + $t }
+    if ($t -match '[",\r\n]') { $t = '"' + $t.Replace('"', '""') + '"' }
+    return $t
+}
+
+function Write-ArmingReport {
+    # CSV next to the audit file: doorkeeper-arming-<stamp>.csv. Returns the file name (without folder).
+    param([string]$Label, [string]$Action, $Rows)
+    $dir = Split-Path -Parent $script:AuditPath
+    if ($dir -and -not (Test-Path -LiteralPath $dir)) { [void](New-Item -ItemType Directory -Path $dir -Force) }
+    $now = [DateTime]::UtcNow
+    $base = 'doorkeeper-arming-' + $now.ToString('yyyyMMdd-HHmmss')
+    $name = $base + '.csv'
+    $n = 1
+    while (Test-Path -LiteralPath (Join-Path $dir $name)) { $n++; $name = $base + '-' + $n + '.csv' }
+    $ts = $now.ToString('yyyy-MM-ddTHH:mm:ssZ')
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.Append("time,action,group_or_selection,door_id,door_name,location,ok,reply_or_fault,state_after`r`n")
+    foreach ($row in @($Rows)) {
+        $loc = Get-DoorLocation -Door $row.Door -Locations $script:Config.locations
+        $why = [string]$row.Reply
+        if (-not $row.Ok) { $why = [string]$row.Fault }
+        $okText = 'false'
+        if ($row.Ok) { $okText = 'true' }
+        $cells = @($ts, $Action, $Label, $row.Id, $row.Name, $loc.Text, $okText, $why, [string]$row.State)
+        [void]$sb.Append((($cells | ForEach-Object { ConvertTo-CsvCell $_ }) -join ',') + "`r`n")
+    }
+    [System.IO.File]::WriteAllText((Join-Path $dir $name), $sb.ToString(), (New-Object System.Text.UTF8Encoding($false)))
+    return $name
 }
 
 # ============================================================================
@@ -1541,21 +1737,30 @@ function Get-DoorStates {
     if ($checks.Count -eq 0) { throw (New-ApiException 400 'not_configured' 'No door state checks are set. Open the Setup tab (Door state).') }
     $list = @($Doors | Where-Object { $null -ne $_ })
     if ($list.Count -eq 0) { throw (New-ApiException 400 'bad_request' 'No doors to check.') }
+    # More doors than "Doors per socket session" are read in several sessions, one after the other.
     $max = Get-MaxDoorsPerRefresh
-    if ($list.Count -gt $max) { throw (New-ApiException 400 'too_many_doors' ('Too many doors for one request (' + $list.Count + ', the limit is ' + $max + '). Filter the list first.')) }
-    $plan = @(Get-DoorStatePlan -Doors $list -Checks $checks)
-    $cmds = @(Get-DoorStateCommands -Plan $plan)
-    $results = @()
-    if ($cmds.Count -gt 0) {
-        $login = Get-SocketLoginText -Rid $Rid
-        if ($login.Error) {
-            Write-DebugLog $Rid ('Refused before sending: ' + $login.Error) 'ERROR'
-            throw (New-ApiException 400 'bad_value' $login.Error)
+    $states = @()
+    $login = $null
+    for ($off = 0; $off -lt $list.Count; $off += $max) {
+        $part = @($list[$off..([Math]::Min($off + $max, $list.Count) - 1)])
+        $plan = @(Get-DoorStatePlan -Doors $part -Checks $checks)
+        $cmds = @(Get-DoorStateCommands -Plan $plan)
+        $results = @()
+        if ($cmds.Count -gt 0) {
+            if ($null -eq $login) {
+                $login = Get-SocketLoginText -Rid $Rid
+                if ($login.Error) {
+                    Write-DebugLog $Rid ('Refused before sending: ' + $login.Error) 'ERROR'
+                    throw (New-ApiException 400 'bad_value' $login.Error)
+                }
+            }
+            if ($list.Count -gt $max) { Write-DebugLog $Rid ('State session for doors ' + ($off + 1) + '-' + ($off + $part.Count) + ' of ' + $list.Count) }
+            $sess = Invoke-SocketSession -Rid $Rid -What 'state' -LoginText $login.Text -LoginShown $login.Shown -Commands $cmds
+            $results = @($sess.results)
         }
-        $sess = Invoke-SocketSession -Rid $Rid -What 'state' -LoginText $login.Text -LoginShown $login.Shown -Commands $cmds
-        $results = @($sess.results)
+        $states += @(Get-DoorStatesFromResults -Plan $plan -Checks $checks -Results $results -OtherwiseLabel ([string]$script:Config.doorState.otherwiseLabel))
     }
-    return @{ states = @(Get-DoorStatesFromResults -Plan $plan -Checks $checks -Results $results -OtherwiseLabel ([string]$script:Config.doorState.otherwiseLabel)) }
+    return @{ states = @($states) }
 }
 
 function Invoke-SocketDoorAction {
@@ -1676,7 +1881,8 @@ function Invoke-DoorBatch {
     # One action on many doors. Socket transport: ONE session (login + init once, the action command of every door,
     # then the state checks of every door). SOAP transport: one call per door in turn. A door with a refused value is
     # reported and not sent; the others go on. One audit record per door, tagged batch:<request id>.
-    param([string]$Rid, [string]$Action, $Doors)
+    # -Report (an object with a label) also writes the arming report CSV next to the audit file; the answer names it.
+    param([string]$Rid, [string]$Action, $Doors, $Report = $null)
     if (@('lock', 'unlock', 'access', 'normal') -notcontains $Action) { throw (New-ApiException 400 'bad_action' 'Unknown action.') }
     $a = $script:Config.actions.$Action
     $socket = ([string]$a.transport -eq 'socket')
@@ -1690,7 +1896,6 @@ function Invoke-DoorBatch {
     $list = @($Doors | Where-Object { $null -ne $_ })
     if ($list.Count -eq 0) { throw (New-ApiException 400 'bad_request' 'Select at least one door.') }
     $max = Get-MaxDoorsPerRefresh
-    if ($list.Count -gt $max) { throw (New-ApiException 400 'too_many_doors' ('Too many doors for one batch (' + $list.Count + ', the limit is ' + $max + ').')) }
     $tag = 'batch:' + $Rid
     $checks = @(Get-DoorStateChecks)
     $other = [string]$script:Config.doorState.otherwiseLabel
@@ -1707,32 +1912,47 @@ function Invoke-DoorBatch {
             if ($x.Error) { $row.Refused = $true; $row.Fault = $x.Error; Write-DebugLog $Rid ('Refused before sending [' + $row.Name + ']: ' + $x.Error) 'ERROR' }
             else { $row.Text = $x.Text; $send += $row }
         }
-        $cmds = @()
-        foreach ($row in $send) { $cmds += @{ Text = $row.Text; Shown = $row.Text; Pattern = [string]$a.successPattern; Key = 'action' } }
-        $plan = @()
-        if ($checks.Count -gt 0 -and $send.Count -gt 0) {
-            $plan = @(Get-DoorStatePlan -Doors @($send | ForEach-Object { $_.Door }) -Checks $checks)
-            $cmds += @(Get-DoorStateCommands -Plan $plan)
-        }
-        if ($cmds.Count -gt 0) {
+        # More doors than "Doors per socket session" go in several sessions, one after the other. A failure in the
+        # first session fails the batch as before; a later failure leaves the doors already done as they are and marks
+        # the rest "Not sent", so the report shows exactly what happened.
+        if ($checks.Count -gt 0) { $states = @() }
+        $login = $null
+        $stopWhy = $null
+        for ($off = 0; $off -lt $send.Count; $off += $max) {
+            $part = @($send[$off..([Math]::Min($off + $max, $send.Count) - 1)])
+            if ($null -ne $stopWhy) {
+                foreach ($row in $part) { $row.Ok = $false; $row.Fault = 'Not sent: ' + $stopWhy }
+                continue
+            }
+            $cmds = @()
+            foreach ($row in $part) { $cmds += @{ Text = $row.Text; Shown = $row.Text; Pattern = [string]$a.successPattern; Key = 'action' } }
+            $plan = @()
+            if ($checks.Count -gt 0) {
+                $plan = @(Get-DoorStatePlan -Doors @($part | ForEach-Object { $_.Door }) -Checks $checks)
+                $cmds += @(Get-DoorStateCommands -Plan $plan)
+            }
             try {
-                $login = Get-SocketLoginText -Rid $Rid
-                if ($login.Error) {
-                    Write-DebugLog $Rid ('Refused before sending: ' + $login.Error) 'ERROR'
-                    throw (New-ApiException 400 'bad_value' $login.Error)
+                if ($null -eq $login) {
+                    $login = Get-SocketLoginText -Rid $Rid
+                    if ($login.Error) {
+                        Write-DebugLog $Rid ('Refused before sending: ' + $login.Error) 'ERROR'
+                        throw (New-ApiException 400 'bad_value' $login.Error)
+                    }
                 }
+                if ($send.Count -gt $max) { Write-DebugLog $Rid ('Batch session for doors ' + ($off + 1) + '-' + ($off + $part.Count) + ' of ' + $send.Count) }
                 $sess = Invoke-SocketSession -Rid $Rid -What ('batch ' + $Action) -LoginText $login.Text -LoginShown $login.Shown -Commands $cmds
                 $rs = @($sess.results)
-                for ($i = 0; $i -lt $send.Count; $i++) {
-                    $send[$i].Ok = [bool]$rs[$i].Ok
-                    $send[$i].Reply = [string]$rs[$i].Reply
-                    if (-not $rs[$i].Ok) { $send[$i].Fault = [string]$rs[$i].Fault }
+                for ($i = 0; $i -lt $part.Count; $i++) {
+                    $part[$i].Ok = [bool]$rs[$i].Ok
+                    $part[$i].Reply = [string]$rs[$i].Reply
+                    if (-not $rs[$i].Ok) { $part[$i].Fault = [string]$rs[$i].Fault }
                 }
-                if ($plan.Count -gt 0) { $states = @(Get-DoorStatesFromResults -Plan $plan -Checks $checks -Results @($rs | Select-Object -Skip $send.Count) -OtherwiseLabel $other) }
+                if ($plan.Count -gt 0) { $states += @(Get-DoorStatesFromResults -Plan $plan -Checks $checks -Results @($rs | Select-Object -Skip $part.Count) -OtherwiseLabel $other) }
             }
             catch {
-                $caught = $_.Exception
-                foreach ($row in $send) { $row.Ok = $false; $row.Fault = $caught.Message }
+                foreach ($row in $part) { $row.Ok = $false; $row.Fault = $_.Exception.Message }
+                if ($off -eq 0) { $caught = $_.Exception; $stopWhy = $_.Exception.Message }
+                else { $stopWhy = $_.Exception.Message; Write-DebugLog $Rid ('Batch stopped after ' + $off + ' door(s): ' + $stopWhy) 'ERROR' }
             }
         }
     }
@@ -1781,7 +2001,54 @@ function Invoke-DoorBatch {
     }
     $tr = 'soap'
     if ($socket) { $tr = 'socket' }
-    return @{ ok = ($okCount -eq $rows.Count); action = $Action; transport = $tr; batch = $Rid; count = $rows.Count; okCount = $okCount; failCount = ($rows.Count - $okCount); results = @($out) }
+    $reportFile = ''
+    $reportError = ''
+    if ($null -ne $Report) {
+        try {
+            $lab = ([string](Get-JsonProp $Report 'label')).Trim()
+            if ($lab.Length -gt 200) { $lab = $lab.Substring(0, 200) }
+            $reportFile = Write-ArmingReport -Label $lab -Action $Action -Rows $rows
+            Write-DebugLog $Rid ('Arming report written: ' + $reportFile)
+        }
+        catch { $reportError = $_.Exception.Message; Write-DebugLog $Rid ('Arming report not written: ' + $reportError) 'ERROR' }
+    }
+    return @{ ok = ($okCount -eq $rows.Count); action = $Action; transport = $tr; batch = $Rid; count = $rows.Count; okCount = $okCount; failCount = ($rows.Count - $okCount); results = @($out); reportFile = $reportFile; reportError = $reportError }
+}
+
+function Get-PagedDoorList {
+    # Runs the door list one page at a time. Fetch is a scriptblock: param([string]$Body, [int]$Page) that returns
+    # @{ ok; httpStatus; fault; doors; raw }. Paging runs only when PageSize > 0 and the body holds {{start}}:
+    # {{start}} = record offset (0, PageSize, 2*PageSize ...), {{pageSize}} = PageSize. Stops on a short page, a page
+    # with no new id (the server ignores the offset) or MaxPages. Doors are kept by id, first wins.
+    # A failed page fails the whole list (ok=false, failedPage set) - never a half list that looks complete.
+    param([string]$BodyTemplate, [int]$PageSize, [scriptblock]$Fetch, [int]$MaxPages = 1000)
+    if ($null -eq $BodyTemplate) { $BodyTemplate = '' }
+    $paged = ($PageSize -gt 0 -and $BodyTemplate.Contains('{{start}}'))
+    $all = New-Object System.Collections.ArrayList
+    $seen = @{}
+    $page = 0
+    $raw = $null
+    while ($true) {
+        $page++
+        $body = $BodyTemplate
+        if ($paged) { $body = $body.Replace('{{start}}', [string](($page - 1) * $PageSize)).Replace('{{pageSize}}', [string]$PageSize) }
+        $r = & $Fetch $body $page
+        if ($page -eq 1) { $raw = $r.raw }
+        if (-not $r.ok) {
+            return @{ ok = $false; httpStatus = $r.httpStatus; fault = $r.fault; doors = @($all.ToArray()); raw = $r.raw; pages = $page; failedPage = $page }
+        }
+        $got = @($r.doors)
+        $new = 0
+        foreach ($d in $got) {
+            $k = [string]$d.id
+            if ($seen.ContainsKey($k)) { continue }
+            $seen[$k] = $true
+            [void]$all.Add($d)
+            $new++
+        }
+        if (-not $paged -or $got.Count -lt $PageSize -or $new -eq 0 -or $page -ge $MaxPages) { break }
+    }
+    return @{ ok = $true; httpStatus = $r.httpStatus; fault = $null; doors = @($all.ToArray()); raw = $raw; pages = $page; failedPage = 0 }
 }
 
 function Get-DoorsFromServer {
@@ -1789,18 +2056,33 @@ function Get-DoorsFromServer {
     $a = $script:Config.actions.listDoors
     if (-not $a.operation) { throw (New-ApiException 400 'not_configured' 'The list doors action is not mapped on the Setup tab.') }
     if (-not $a.itemElement -or -not $a.idField) { throw (New-ApiException 400 'not_configured' 'Set the door element and the id field on the Setup tab.') }
-    $r = Invoke-SoapCall -Rid $Rid -What 'listDoors' -SoapAction ([string]$a.soapAction) -BodyTemplate ([string]$a.body)
-    $doors = @()
-    if ($r.ok) {
-        try { $doors = @(ConvertFrom-DoorList -Text $r.rawText -ItemElement ([string]$a.itemElement) -IdField ([string]$a.idField) -NameField ([string]$a.nameField) -ExtraFields @($a.extraFields)) }
-        catch {
-            Write-DebugLog $Rid ('Door list parse failed' + "`r`n" + (Format-ExceptionDetail $_.Exception)) 'ERROR'
-            throw (New-ApiException 502 'parse_failed' ('The response could not be parsed: ' + $_.Exception.Message))
+    $ps = 0
+    [void][int]::TryParse([string]$a.pageSize, [ref]$ps)
+    $fetch = {
+        param([string]$Body, [int]$Page)
+        $r = Invoke-SoapCall -Rid $Rid -What 'listDoors' -SoapAction ([string]$a.soapAction) -BodyTemplate $Body
+        $d = @()
+        if ($r.ok) {
+            try { $d = @(ConvertFrom-DoorList -Text $r.rawText -ItemElement ([string]$a.itemElement) -IdField ([string]$a.idField) -NameField ([string]$a.nameField) -ExtraFields @($a.extraFields)) }
+            catch {
+                Write-DebugLog $Rid ('Door list parse failed (page ' + $Page + ')' + "`r`n" + (Format-ExceptionDetail $_.Exception)) 'ERROR'
+                throw (New-ApiException 502 'parse_failed' ('The response could not be parsed (page ' + $Page + '): ' + $_.Exception.Message))
+            }
+            Write-DebugLog $Rid ('Door list page ' + $Page + ': ' + $d.Count + ' door(s) with element "' + $a.itemElement + '"')
         }
-        Write-DebugLog $Rid ('Door list parsed: ' + $doors.Count + ' door(s) with element "' + $a.itemElement + '"')
-        $script:LastDoorCount = $doors.Count
+        return @{ ok = $r.ok; httpStatus = $r.httpStatus; fault = $r.fault; doors = @($d); raw = $r.response }
     }
-    return @{ ok = $r.ok; httpStatus = $r.httpStatus; fault = $r.fault; doors = @($doors); raw = $r.response }
+    $res = Get-PagedDoorList -BodyTemplate ([string]$a.body) -PageSize $ps -Fetch $fetch
+    if ($res.ok) {
+        Write-DebugLog $Rid ('Door list parsed: ' + @($res.doors).Count + ' door(s) in ' + $res.pages + ' page(s)')
+        $script:LastDoorCount = @($res.doors).Count
+    }
+    elseif ($res.failedPage -gt 1) {
+        $why = $res.fault
+        if (-not $why) { $why = 'HTTP ' + $res.httpStatus }
+        $res.fault = 'page ' + $res.failedPage + ' failed after ' + @($res.doors).Count + ' door(s): ' + $why
+    }
+    return @{ ok = $res.ok; httpStatus = $res.httpStatus; fault = $res.fault; doors = @($res.doors); raw = $res.raw; pages = $res.pages }
 }
 
 # ============================================================================
@@ -1976,7 +2258,7 @@ function Invoke-Route {
             Assert-Licensed
             $in = Read-RequestJson $req
             if ($null -eq $in -or $null -eq $in.doors) { throw (New-ApiException 400 'bad_request' 'An action and a list of doors are required.') }
-            return @{ Status = 200; Json = (Invoke-DoorBatch -Rid $Rid -Action ([string]$in.action) -Doors @($in.doors)) }
+            return @{ Status = 200; Json = (Invoke-DoorBatch -Rid $Rid -Action ([string]$in.action) -Doors @($in.doors) -Report $in.report) }
         }
         'POST /api/v1/socket' {
             Assert-Licensed
@@ -2007,6 +2289,14 @@ function Invoke-Route {
             try { $ms = New-Object System.IO.MemoryStream; $fs.CopyTo($ms); $bytes = $ms.ToArray() } finally { $fs.Close() }
             return @{ Status = 200; Bytes = $bytes; ContentType = 'text/plain; charset=utf-8'
                 Headers = @{ 'Content-Disposition' = 'attachment; filename="' + [System.IO.Path]::GetFileName($script:DebugLogPath) + '"' } }
+        }
+        'GET /api/v1/arming/report' {
+            $f = [string]$req.QueryString['file']
+            if ($f -notmatch '^doorkeeper-arming-\d{8}-\d{6}(-\d+)?\.csv$') { throw (New-ApiException 400 'bad_request' 'Bad file name.') }
+            $p = Join-Path (Split-Path -Parent $script:AuditPath) $f
+            if (-not (Test-Path -LiteralPath $p)) { throw (New-ApiException 404 'not_found' 'No such arming report.') }
+            return @{ Status = 200; Bytes = [System.IO.File]::ReadAllBytes($p); ContentType = 'text/csv; charset=utf-8'
+                Headers = @{ 'Content-Disposition' = 'attachment; filename="' + $f + '"' } }
         }
         'POST /api/v1/diagnostics' {
             $p = New-DiagnosticsZip
@@ -2073,6 +2363,10 @@ function Invoke-Request {
             $result = New-ErrorResult 500 'internal' ('Unexpected error: ' + $e.Message)
             $errNote = ' unhandled exception (see above)'
         }
+    }
+    # Errors returned (not thrown) by the route, e.g. the 403 token / origin checks, also name their reason in the log.
+    if (-not $errNote -and $result.Status -ge 400 -and $result.Json -and $result.Json.error) {
+        $errNote = ' error=' + $result.Json.error.code + ': ' + $result.Json.error.message
     }
     try { Send-Result -Ctx $Ctx -Result $result -Rid $rid }
     catch { Write-DebugLog $rid ('Sending the response failed: ' + $_.Exception.Message) 'ERROR' }
@@ -2201,6 +2495,34 @@ pre{background:#101820;color:#d8e4f0;padding:10px;overflow:auto;max-height:480px
 .dlg .box.danger #confirm-ok{background:var(--red);color:#fff;border:none;font-weight:700}
 #confirm-ok{background:var(--blue-deep);color:#fff;border:none;font-weight:600}
 #about .kv{margin:0}
+#doors-layout{display:flex;gap:16px;align-items:flex-start}
+#doors-main{flex:1 1 0;min-width:0}
+#loc-side{flex:0 0 360px;max-width:360px;border:1px solid var(--line);border-radius:8px;padding:10px 12px;background:#fff}
+#loc-side h3{margin:0 0 6px;font-size:13px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted)}
+#groups-panel{margin-bottom:12px;padding-bottom:10px;border-bottom:1px solid var(--line)}
+.grp{display:flex;flex-wrap:wrap;align-items:center;gap:6px;padding:4px 0}
+.grp .grp-name{flex:1 1 100%;color:var(--ink)}
+.grp .grp-count{color:var(--muted);font-size:12px;margin-right:4px}
+.loc-ul{list-style:none;margin:0;padding-left:14px}
+#loc-tree>.loc-ul{padding-left:0}
+.loc-row{display:flex;flex-wrap:wrap;align-items:center;gap:6px;padding:3px 4px;border-radius:6px}
+.loc-row.node-on{background:var(--tint);outline:1px solid var(--tint-line)}
+button.loc-name{height:26px;padding:0 8px;border:none;background:transparent;font-weight:600;color:var(--ink);text-align:left}
+button.loc-name:hover{background:var(--tint)}
+.loc-sum{font-size:12px;color:var(--muted);flex:1 1 auto}
+button.arm-btn{height:26px;padding:0 8px;font-size:12px}
+#btn-arm,#btn-disarm{height:36px;padding:0 14px;font-size:14px}
+#btn-arm{background:var(--ink);color:#fff;border:none;font-weight:600}
+#loc-filter-note{margin:0 0 8px;font-size:12px;color:var(--blue-dark)}
+#arm-report{margin:12px 0;padding:12px 16px;background:#fff;border:1px solid var(--tint-line);border-radius:8px}
+#arm-report h3{margin:0 0 6px;font-size:16px;color:var(--ink)}
+#arm-report .rep-sum{margin:4px 0;font-weight:600}
+#arm-report table{margin:8px 0}
+.hint{margin:4px 0 8px;font-size:12px;color:#52606f}
+.loc-out{font:12px var(--mono);background:var(--surface);padding:8px;border-radius:6px;margin:6px 0;min-height:20px}
+.grp-edit{display:flex;flex-wrap:wrap;align-items:flex-end;gap:6px;padding:6px 0;border-bottom:1px solid #ECEEF2}
+.grp-edit .grp-matches{font-size:12px;color:var(--muted);align-self:center}
+@media(max-width:1000px){#doors-layout{flex-direction:column}#loc-side{flex:1 1 auto;max-width:none;width:100%}}
 </style>
 </head>
 <body>
@@ -2242,8 +2564,26 @@ pre{background:#101820;color:#d8e4f0;padding:10px;overflow:auto;max-height:480px
     <span id="door-counts"></span>
   </div>
   <div class="msg" id="doors-msg"></div>
-  <div id="batch-bar" style="display:none"><b id="batch-count">0 selected</b> <span id="batch-buttons"></span> <button id="btn-lockdown" class="lockdown"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="11" width="18" height="11" rx="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg>Lockdown</button></div>
-  <table><thead id="doors-head"></thead><tbody id="doors-body"></tbody></table>
+  <div id="batch-bar" style="display:none"><b id="batch-count">0 selected</b> <span id="batch-buttons"></span> <span id="arm-buttons"><button id="btn-arm" class="arm-btn sel-arm" data-kind="arm" type="button">Arm selected</button> <button id="btn-disarm" class="arm-btn sel-arm" data-kind="disarm" type="button">Disarm selected</button></span> <button id="btn-lockdown" class="lockdown"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="11" width="18" height="11" rx="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg>Lockdown</button></div>
+  <div id="arm-report" style="display:none">
+    <h3 id="arm-report-title"></h3>
+    <div class="rep-sum" id="arm-report-sum"></div>
+    <div id="arm-report-state"></div>
+    <div class="msg" id="arm-report-note"></div>
+    <table id="arm-report-table"><thead><tr><th>Failed door</th><th>Location</th><th>Reply / fault</th><th>State after</th></tr></thead><tbody id="arm-report-failed"></tbody></table>
+    <button id="arm-retry" type="button">Retry failed</button>
+    <button id="arm-export" type="button">Export CSV</button>
+    <button id="arm-close" type="button">Close report</button>
+  </div>
+  <div id="doors-layout">
+    <aside id="loc-side" style="display:none">
+      <div id="groups-panel" style="display:none"><h3>Door groups</h3><div id="groups-list"></div></div>
+      <div id="loc-tree-box"><h3>Locations</h3>
+        <div id="loc-filter-note" style="display:none"><span id="loc-filter-text"></span> <button id="loc-filter-clear" type="button">Show all doors</button></div>
+        <div id="loc-tree"></div></div>
+    </aside>
+    <div id="doors-main"><table><thead id="doors-head"></thead><tbody id="doors-body"></tbody></table></div>
+  </div>
 </div>
 
 <div class="panel" id="tab-setup">
@@ -2286,6 +2626,7 @@ pre{background:#101820;color:#d8e4f0;padding:10px;overflow:auto;max-height:480px
     <label style="display:block"><span>Init commands (one per line, each sent after the login; one reply line is read for each)</span><textarea id="sk-initCommands" style="min-height:44px"></textarea></label>
   </fieldset>
   <div id="setup-doorstate"></div>
+  <div id="setup-locations"></div>
   <p><button id="btn-load-wsdl">Load WSDL</button> <span id="wsdl-status"></span></p>
   <div id="setup-actions"></div>
   <div class="setup-bar">
@@ -2357,6 +2698,7 @@ var TOKEN=document.querySelector('meta[name="console-token"]').getAttribute('con
 var ACTIONS=['listDoors','lock','unlock','access','normal'];
 var DOOR_ACTIONS=['lock','unlock','access','normal'];
 var CFG=null,LIC=null,OPS=[],DOORS=[],debugTimer=null,SEL={},STATES={},RES={},BATCH_BUSY=false,DS_ROWS=4;
+var PLACE={},NODES={},TREE_DOORS=null,TREE_LOC='',LOCFILTER='',ARMREP=null;
 function $(id){return document.getElementById(id);}
 function h(tag,attrs,kids){
   var e=document.createElement(tag);
@@ -2374,7 +2716,15 @@ function api(method,path,body,rawText){
       var j=null;try{j=JSON.parse(txt);}catch(e){}
       var rid=(j&&j.requestId)||r.headers.get('X-Request-Id')||'-';
       if(!r.ok){
-        var er=new Error((j&&j.error&&j.error.message)||('HTTP '+r.status));
+        var msg=(j&&j.error&&j.error.message)||('HTTP '+r.status);
+        if(r.status===403&&msg.indexOf('X-Console-Token')>=0){
+          // DoorKeeper was restarted and issued a new page key: this page is from the earlier run. Reload it once
+          // (a guard stops a reload loop if the key still does not match).
+          var last=0;try{last=parseInt(sessionStorage.getItem('dk-stale-reload')||'0',10)||0;}catch(e){}
+          if(Date.now()-last>10000){try{sessionStorage.setItem('dk-stale-reload',String(Date.now()));}catch(e){}location.reload();}
+          msg='DoorKeeper was restarted, so this page was out of date and reloads itself. If this message stays, open '+location.origin+'/ again.';
+        }
+        var er=new Error(msg);
         er.rid=rid;er.code=(j&&j.error&&j.error.code)||'';throw er;
       }
       j=j||{};j._rid=rid;return j;
@@ -2539,9 +2889,75 @@ $('btn-logout').onclick=function(){api('POST','/api/v1/logout').then(renderSessi
 /* ---- doors ---- */
 function stateOn(){return !!(CFG&&CFG.doorState&&CFG.doorState.checks&&CFG.doorState.checks.length);}
 function slim(d){return {id:d.id,name:d.name,extra:d.extra||{}};}
+/* ---- locations: JS twin of Get-DoorLocation / Test-DoorInGroup on the server (tests\fixtures\locations.json feeds both) ---- */
+function hasOwn(o,k){return Object.prototype.hasOwnProperty.call(o,k);}
+function placeDoor(d,loc){
+  var fields={},rule=0,extra=d.extra||{};
+  var levels=((loc&&loc.levels)||[]).map(String).filter(function(x){return x;});
+  if(loc){
+    var rules=loc.rules||[];
+    for(var i=0;i<rules.length;i++){
+      var r=rules[i];
+      if(!r||!r.pattern){continue;}
+      var val=(r.source==='name')?d.name:((r.source==='id')?d.id:(hasOwn(extra,r.source)?extra[r.source]:''));
+      val=(val===undefined||val===null)?'':String(val);
+      if(!val){continue;}
+      var re=null;try{re=new RegExp(r.pattern);}catch(e){continue;}
+      var m=re.exec(val);
+      if(!m){continue;}
+      var g=m.groups||{};
+      Object.keys(g).forEach(function(k){if(g[k]){fields[k]=g[k];}});
+      rule=i+1;break;
+    }
+    var map=loc.map||{};
+    var keys=[String(d.id),String(d.name)];
+    Object.keys(extra).forEach(function(k){keys.push(String(extra[k]));});
+    for(var j=0;j<keys.length;j++){
+      if(!keys[j]||!hasOwn(map,keys[j])){continue;}
+      var ent=map[keys[j]]||{};
+      Object.keys(ent).forEach(function(k){if(ent[k]){fields[k]=String(ent[k]);}});
+      break;
+    }
+  }
+  var path=[];
+  for(var q=0;q<levels.length;q++){if(fields[levels[q]]){path.push(fields[levels[q]]);}else{break;}}
+  return {fields:fields,path:path,placed:path.length>0,text:path.length?path.join('/'):'(unplaced)',rule:rule};
+}
+function doorInGroup(d,pl,g){
+  if(!g){return false;}
+  var ids=[].concat(g.doorIds||[]);
+  for(var i=0;i<ids.length;i++){if(ids[i]!==null&&ids[i]!==undefined&&String(ids[i])===String(d.id)){return true;}}
+  var m=g.match||{},used=0,all=true;
+  Object.keys(m).forEach(function(k){
+    var vals=[].concat((m[k]===null||m[k]===undefined)?[]:m[k]).filter(function(x){return x!==null&&x!==undefined&&String(x)!=='';}).map(String);
+    if(!vals.length){return;}
+    used++;
+    if(vals.indexOf(pl.fields[k]||'')<0){all=false;}
+  });
+  return used>0&&all;
+}
+function locLevels(){return ((CFG&&CFG.locations&&CFG.locations.levels)||[]).filter(function(x){return x;});}
+function labelOf(v){var lb=CFG&&CFG.locations&&CFG.locations.labels;return (lb&&hasOwn(lb,v)&&lb[v])?String(lb[v]):v;}
+function pathName(path){return path.map(labelOf).join(' / ');}
+function placeAll(){PLACE={};var loc=CFG&&CFG.locations;DOORS.forEach(function(d){PLACE[d.id]=placeDoor(d,loc);});}
+function groupDoors(g){return DOORS.filter(function(d){return PLACE[d.id]&&doorInGroup(d,PLACE[d.id],g);});}
+function stateSummary(ids){
+  if(!stateOn()){return '';}
+  var n={},order=['Locked','Unlocked','Normal'];
+  ids.forEach(function(id){var st=STATES[id];if(st){n[st.state]=(n[st.state]||0)+1;}});
+  var keys=Object.keys(n).sort(function(a,b){var x=order.indexOf(a),y=order.indexOf(b);x=x<0?99:x;y=y<0?99:y;return x!==y?x-y:(a<b?-1:1);});
+  return keys.map(function(k){return n[k]+' '+k;}).join(', ');
+}
 function visibleDoors(){
   var f=$('door-filter').value.toLowerCase();
-  return DOORS.filter(function(d){return !f||(d.name+' '+d.id).toLowerCase().indexOf(f)>=0;});
+  var set=(LOCFILTER&&NODES[LOCFILTER])?NODES[LOCFILTER].set:null;
+  return DOORS.filter(function(d){
+    if(set&&!set[d.id]){return false;}
+    if(!f){return true;}
+    var pl=PLACE[d.id],loc='';
+    if(pl){loc=Object.keys(pl.fields).map(function(k){return pl.fields[k]+' '+labelOf(pl.fields[k]);}).join(' ');}
+    return (d.name+' '+d.id+' '+loc).toLowerCase().indexOf(f)>=0;
+  });
 }
 function selectedDoors(){return DOORS.filter(function(d){return SEL[d.id];});}
 function rowOf(id){
@@ -2570,6 +2986,7 @@ function setState(id,state,detail){
   renderCounts();
 }
 function renderCounts(){
+  paintTree();
   var box=$('door-counts');box.innerHTML='';
   if(!DOORS.length){return;}
   box.appendChild(h('span',{text:DOORS.length+' doors'}));
@@ -2590,13 +3007,178 @@ function updateBatchBar(){
   renderCounts();
   var vis=visibleDoors();var sa=$('sel-all');
   if(sa){sa.checked=vis.length>0&&vis.every(function(d){return SEL[d.id];});}
+  paintArm(sel);
+}
+/* ---- arming: Arm = arming.armAction, Disarm = arming.disarmAction (door actions of the Setup tab) ---- */
+function armInfo(kind){
+  var ar=(CFG&&CFG.arming)||{};
+  var key=(kind==='arm')?(ar.armAction||'lock'):(ar.disarmAction||'normal');
+  var label=(kind==='arm')?(ar.armLabel||'Arm'):(ar.disarmLabel||'Disarm');
+  return {key:key,label:label,mapped:!!(CFG&&CFG.actions&&CFG.actions[key]&&isMapped(CFG.actions[key]))};
+}
+function paintArm(sel){
+  Array.prototype.forEach.call(document.querySelectorAll('button.arm-btn'),function(b){
+    var info=armInfo(b.getAttribute('data-kind'));
+    var own=b.classList.contains('sel-arm');
+    b.textContent=info.label+(own?' selected':'');
+    var why='';
+    if(licBlocked()){why=licTip();}
+    else if(!info.mapped){why='Not available: the "'+info.key+'" action is not mapped on the Setup tab.';}
+    b.disabled=!!why||BATCH_BUSY||(own&&sel===0)||b.getAttribute('data-n')==='0';
+    b.title=why;
+  });
+  var rb=$('arm-retry');
+  if(rb){rb.disabled=BATCH_BUSY||licBlocked()||!ARMREP||!ARMREP.failed.length;}
+}
+function selScope(doors){
+  if(!locLevels().length){return {name:'the selection',label:'selection of '+doors.length+' doors'};}
+  var seen={},names=[],texts=[];
+  doors.forEach(function(d){
+    var pl=PLACE[d.id];var t=pl?pl.text:'(unplaced)';
+    if(!seen[t]){seen[t]=true;texts.push(t);names.push((pl&&pl.placed)?pathName(pl.path):'(unplaced)');}
+  });
+  return {name:'the selection: '+names.slice(0,3).join('; ')+(names.length>3?'; ...':''),label:'selection: '+texts.slice(0,5).join(', ')+(texts.length>5?', ...':'')};
+}
+function armRun(kind,doors,scope){
+  var info=armInfo(kind);
+  if(!doors.length||!info.mapped){return;}
+  runBatch(info.key,doors,info.label+' '+doors.length+' door(s) in '+scope.name+'?',{title:info.label,ok:info.label},
+    {report:{label:scope.label},kindLabel:info.label,scopeName:scope.name,reportLabel:scope.label});
+}
+function applySel(ids,val){
+  ids.forEach(function(id){SEL[id]=val;var row=rowOf(id);if(row){row.querySelector('input.sel').checked=val;}});
+  updateBatchBar();
+}
+function selectOnly(ids){
+  SEL={};ids.forEach(function(id){SEL[id]=true;});
+  Array.prototype.forEach.call($('doors-body').children,function(r){r.querySelector('input.sel').checked=!!SEL[r.getAttribute('data-id')];});
+  updateBatchBar();
+}
+/* ---- location tree and door groups panel ---- */
+function cmpNode(a,b){
+  if(a.key==='(unplaced)'){return 1;}
+  if(b.key==='(unplaced)'){return -1;}
+  return a.path[a.path.length-1].localeCompare(b.path[b.path.length-1],undefined,{numeric:true});
+}
+function buildTreeData(){
+  NODES={};var roots=[];
+  function node(path,parent){
+    var key=path.join('/');
+    if(!NODES[key]){
+      var n={key:key,path:path,ids:[],set:{},children:[],level:path.length-1,name:(key==='(unplaced)')?key:labelOf(path[path.length-1])};
+      NODES[key]=n;(parent?parent.children:roots).push(n);
+    }
+    return NODES[key];
+  }
+  DOORS.forEach(function(d){
+    var pl=PLACE[d.id];var path=pl.placed?pl.path:['(unplaced)'];var parent=null;
+    for(var i=1;i<=path.length;i++){var n=node(path.slice(0,i),parent);n.ids.push(d.id);n.set[d.id]=true;parent=n;}
+  });
+  function sortAll(list){list.sort(cmpNode);list.forEach(function(n){sortAll(n.children);});}
+  sortAll(roots);
+  return roots;
+}
+function nodeDoors(n){return DOORS.filter(function(d){return n.set[d.id];});}
+function renderNode(n){
+  var lv=locLevels()[n.level]||'';
+  var cb=h('input',{type:'checkbox','class':'loc-cb',title:'Select all doors here'});
+  var nm=h('button',{'class':'loc-name',type:'button',text:n.name,title:(lv?(lv+': '):'')+n.path[n.path.length-1]+' - click to show only these doors'});
+  var sum=h('span',{'class':'loc-sum'});
+  var ar=h('button',{'class':'arm-btn loc-arm',type:'button','data-kind':'arm'});
+  var di=h('button',{'class':'arm-btn loc-disarm',type:'button','data-kind':'disarm'});
+  var row=h('div',{'class':'loc-row'},[cb,nm,sum,ar,di]);
+  n.cb=cb;n.sum=sum;n.row=row;
+  cb.onchange=function(){applySel(n.ids,cb.checked);};
+  nm.onclick=function(){LOCFILTER=(LOCFILTER===n.key)?'':n.key;renderDoors();};
+  var scope={name:(n.key==='(unplaced)')?'the doors without a location':pathName(n.path),label:'location: '+n.key};
+  ar.onclick=function(){armRun('arm',nodeDoors(n),scope);};
+  di.onclick=function(){armRun('disarm',nodeDoors(n),scope);};
+  var li=h('li',{'data-path':n.key},[row]);
+  if(n.children.length){
+    var ul=h('ul',{'class':'loc-ul'});
+    n.children.forEach(function(c){ul.appendChild(renderNode(c));});
+    li.appendChild(ul);
+  }
+  return li;
+}
+function renderTree(){
+  var box=$('loc-tree');box.innerHTML='';
+  TREE_DOORS=DOORS;TREE_LOC=JSON.stringify((CFG&&CFG.locations)||null);
+  NODES={};
+  if(!locLevels().length||!DOORS.length){return;}
+  var ul=h('ul',{'class':'loc-ul'});
+  buildTreeData().forEach(function(n){ul.appendChild(renderNode(n));});
+  box.appendChild(ul);
+}
+function paintTree(){
+  Object.keys(NODES).forEach(function(k){
+    var n=NODES[k];if(!n.cb){return;}
+    var sel=0;n.ids.forEach(function(id){if(SEL[id]){sel++;}});
+    n.cb.checked=sel>0&&sel===n.ids.length;n.cb.indeterminate=sel>0&&sel<n.ids.length;
+    var s=stateSummary(n.ids);
+    n.sum.textContent=n.ids.length+' door'+(n.ids.length===1?'':'s')+(s?(' - '+s):'');
+    n.row.classList.toggle('node-on',LOCFILTER===k);
+  });
+  var note=$('loc-filter-note');
+  if(note){
+    var on=!!(LOCFILTER&&NODES[LOCFILTER]);
+    note.style.display=on?'':'none';
+    if(on){$('loc-filter-text').textContent='Showing only: '+((LOCFILTER==='(unplaced)')?LOCFILTER:pathName(NODES[LOCFILTER].path));}
+  }
+}
+function renderGroups(){
+  var box=$('groups-list');box.innerHTML='';
+  var gs=(CFG&&CFG.groups)||[];
+  $('groups-panel').style.display=(gs.length&&DOORS.length)?'':'none';
+  gs.forEach(function(g){
+    var ds=groupDoors(g);
+    var scope={name:'group "'+g.name+'"',label:'group: '+g.name};
+    var sel=h('button',{'class':'grp-select',type:'button',text:'Select',title:'Select only the doors of this group'});
+    var ar=h('button',{'class':'arm-btn grp-arm',type:'button','data-kind':'arm','data-n':String(ds.length)});
+    var di=h('button',{'class':'arm-btn grp-disarm',type:'button','data-kind':'disarm','data-n':String(ds.length)});
+    sel.onclick=function(){selectOnly(ds.map(function(d){return d.id;}));};
+    ar.onclick=function(){armRun('arm',ds,scope);};
+    di.onclick=function(){armRun('disarm',ds,scope);};
+    box.appendChild(h('div',{'class':'grp','data-group':g.name},[h('b',{'class':'grp-name',text:g.name}),
+      h('span',{'class':'grp-count',text:ds.length+' door'+(ds.length===1?'':'s')}),sel,ar,di]));
+  });
+}
+/* ---- arming report ---- */
+function showReport(r,doors,a,meta){
+  var results=r.results||[];
+  var fails=results.filter(function(x){return !x.ok;});
+  ARMREP={a:a,meta:meta,failed:fails.map(function(x){return x.id;}),file:r.reportFile||''};
+  $('arm-report').style.display='';
+  $('arm-report-title').textContent=meta.kindLabel+' - '+meta.scopeName+(meta.retry?' (retry of the failed doors)':'');
+  $('arm-report-sum').textContent='Requested '+r.count+', OK '+r.okCount+', failed '+r.failCount+'.';
+  var st=stateSummary(results.map(function(x){return x.id;}));
+  $('arm-report-state').textContent=st?('State after: '+st):'';
+  $('arm-report-note').textContent=r.reportError?('The CSV report could not be written: '+r.reportError):(r.reportFile?('CSV report: '+r.reportFile):'');
+  var body=$('arm-report-failed');body.innerHTML='';
+  fails.forEach(function(x){
+    var pl=PLACE[x.id];
+    var stt=STATES[x.id];
+    body.appendChild(h('tr',{'data-id':x.id},[h('td',{text:x.name+' ('+x.id+')'}),h('td',{text:pl?pl.text:''}),
+      h('td',{text:(x.fault||'no reply')+(x.refused?' (refused, not sent)':'')}),h('td',{text:stt?stt.state:''})]));
+  });
+  $('arm-report-table').style.display=fails.length?'':'none';
+  $('arm-export').disabled=!ARMREP.file;
+  paintArm(selectedDoors().length);
 }
 function renderDoors(){
   var extras=(CFG&&CFG.actions.listDoors.extraFields)||[];
+  var levels=locLevels();
+  placeAll();
+  if(TREE_DOORS!==DOORS||TREE_LOC!==JSON.stringify((CFG&&CFG.locations)||null)){renderTree();}
+  if(LOCFILTER&&!NODES[LOCFILTER]){LOCFILTER='';}
+  renderGroups();
+  $('loc-side').style.display=(DOORS.length&&(levels.length||((CFG&&CFG.groups)||[]).length))?'':'none';
+  $('loc-tree-box').style.display=levels.length?'':'none';
   var head=$('doors-head');head.innerHTML='';
   var selAll=h('input',{type:'checkbox',id:'sel-all',title:'Select all shown doors'});
   var tr=h('tr',null,[h('th',null,[selAll]),h('th',{text:'Name'}),h('th',{text:'Id'})]);
   extras.forEach(function(x){tr.appendChild(h('th',{text:x}));});
+  levels.forEach(function(x){tr.appendChild(h('th',{'class':'loc-th','data-level':x,text:x}));});
   if(stateOn()){tr.appendChild(h('th',{text:'State'}));}
   tr.appendChild(h('th',{text:'Actions'}));tr.appendChild(h('th',{text:'Result'}));head.appendChild(tr);
   selAll.onchange=function(){
@@ -2623,6 +3205,9 @@ function renderDoors(){
     cb.onchange=function(){SEL[d.id]=cb.checked;updateBatchBar();};
     var row=h('tr',{'data-id':d.id},[h('td',null,[cb]),h('td',{text:d.name}),h('td',{text:d.id})]);
     extras.forEach(function(x){row.appendChild(h('td',{text:(d.extra&&d.extra[x])||''}));});
+    var pl=PLACE[d.id];
+    row.setAttribute('data-loc',pl?pl.text:'');
+    levels.forEach(function(x){var v=(pl&&pl.fields[x])||'';row.appendChild(h('td',{'class':'loc-td','data-level':x,text:v,title:(v&&labelOf(v)!==v)?labelOf(v):''}));});
     if(stateOn()){
       var stc=h('td',{class:'state'});
       if(STATES[d.id]){paintState(stc,STATES[d.id]);}
@@ -2670,7 +3255,7 @@ function refreshStates(doors){
   }).then(function(){$('btn-refresh-state').disabled=false;});
 }
 /* One action on many doors: one request, one socket session on the server (the page waits for the whole batch). */
-function runBatch(a,doors,question,opts){
+function runBatch(a,doors,question,opts,meta){
   if(!doors.length||BATCH_BUSY){return;}
   var names=doors.slice(0,5).map(function(d){return d.name;}).join(', ')+(doors.length>5?', ...':'');
   confirmDialog(question+' First '+Math.min(5,doors.length)+': '+names,opts).then(function(ok){
@@ -2678,12 +3263,15 @@ function runBatch(a,doors,question,opts){
     BATCH_BUSY=true;updateBatchBar();
     doors.forEach(function(d){setRowResult(d.id,'','working on '+doors.length+' doors...');});
     setMsg('doors-msg','Working on '+doors.length+' door(s)...');
-    return api('POST','/api/v1/doors/batch',{action:a,doors:doors.map(slim)}).then(function(r){
+    var req={action:a,doors:doors.map(slim)};
+    if(meta&&meta.report){req.report=meta.report;}
+    return api('POST','/api/v1/doors/batch',req).then(function(r){
       (r.results||[]).forEach(function(x){
         setRowResult(x.id,x.ok?'ok':'bad',x.ok?('OK (batch)'+(x.reply?(' reply: '+x.reply):'')+' request id '+r._rid):('FAILED: '+(x.fault||'no reply')+(x.refused?' (refused, not sent)':'')+' (request id '+r._rid+')'),r._rid);
         if(x.state!==undefined&&x.state!==null){setState(x.id,x.state,x.stateDetail);}
       });
       setMsg('doors-msg',r.okCount+' of '+r.count+' door(s) OK, '+r.failCount+' failed (request id '+r._rid+')',r.failCount?'bad':'good');
+      if(meta){showReport(r,doors,a,meta);}
     }).catch(function(e){
       doors.forEach(function(d){setRowResult(d.id,'bad','FAILED: '+errText(e),e.rid||'-');});
       setMsg('doors-msg','Batch failed: '+errText(e),'bad');
@@ -2691,6 +3279,24 @@ function runBatch(a,doors,question,opts){
   });
 }
 $('btn-refresh-state').onclick=function(){refreshStates(visibleDoors());};
+$('btn-arm').onclick=function(){var ds=selectedDoors();armRun('arm',ds,selScope(ds));};
+$('btn-disarm').onclick=function(){var ds=selectedDoors();armRun('disarm',ds,selScope(ds));};
+$('loc-filter-clear').onclick=function(){LOCFILTER='';renderDoors();};
+$('arm-close').onclick=function(){ARMREP=null;$('arm-report').style.display='none';updateBatchBar();};
+$('arm-export').onclick=function(){
+  if(!ARMREP||!ARMREP.file){return;}
+  var f=ARMREP.file;
+  download('/api/v1/arming/report?file='+encodeURIComponent(f),f).catch(function(e){setMsg('doors-msg','Export failed: '+e.message,'bad');});
+};
+$('arm-retry').onclick=function(){
+  if(!ARMREP||!ARMREP.failed.length){return;}
+  var set={};ARMREP.failed.forEach(function(id){set[id]=true;});
+  var ds=DOORS.filter(function(d){return set[d.id];});
+  var m=ARMREP.meta;
+  var lab=m.reportLabel+' (retry)';
+  runBatch(ARMREP.a,ds,m.kindLabel+' again: '+ds.length+' failed door(s) of '+m.scopeName+'?',{title:m.kindLabel+' - failed doors',ok:'Retry'},
+    {report:{label:lab},kindLabel:m.kindLabel,scopeName:m.scopeName,reportLabel:lab,retry:true});
+};
 $('btn-lockdown').onclick=function(){
   var def=CFG.actions.lock;
   runBatch('lock',DOORS.slice(),'LOCKDOWN: '+((def&&def.label)||'lock')+' ALL '+DOORS.length+' door(s) in the list?',{danger:true,title:'Lockdown',ok:'Lock all doors'});
@@ -2698,13 +3304,13 @@ $('btn-lockdown').onclick=function(){
 $('btn-load-doors').onclick=function(){
   setMsg('doors-msg','Loading...');
   api('GET','/api/v1/doors').then(function(r){
-    DOORS=r.doors||[];SEL={};STATES={};RES={};renderDoors();loadLicense();
+    DOORS=r.doors||[];SEL={};STATES={};RES={};LOCFILTER='';ARMREP=null;$('arm-report').style.display='none';renderDoors();updateLocTest();loadLicense();
     if(r.ok){
       setMsg('doors-msg',DOORS.length+' door(s) loaded (request id '+r._rid+')','good');
       if(stateOn()&&DOORS.length){return refreshStates(visibleDoors());}
     }
     else{setMsg('doors-msg','AEOS answered with an error: '+(r.fault||('HTTP '+r.httpStatus))+' (request id '+r._rid+')','bad');}
-  }).catch(function(e){DOORS=[];renderDoors();setMsg('doors-msg',errText(e),'bad');});
+  }).catch(function(e){DOORS=[];LOCFILTER='';renderDoors();setMsg('doors-msg',errText(e),'bad');});
 };
 $('door-filter').oninput=renderDoors;
 
@@ -2741,12 +3347,13 @@ function buildSetupActions(){
     var sk=h('button',{id:'skel-'+a,text:'Insert skeleton'});
     sk.onclick=function(){var o=opByName($('op-'+a).value);if(o){$('body-'+a).value=o.skeleton;}else{setMsg('setup-msg','Select an operation (Load WSDL first) to insert its skeleton.','bad');}};
     fs.appendChild(sk);
-    fs.appendChild(h('label',{style:'display:block'},[h('span',{text:'Request body template ({{id}} {{name}} {{ns}} {{tns}})'}),h('textarea',{id:'body-'+a})]));
+    fs.appendChild(h('label',{style:'display:block'},[h('span',{text:a==='listDoors'?'Request body template ({{ns}} {{tns}} {{start}} {{pageSize}})':'Request body template ({{id}} {{name}} {{ns}} {{tns}})'}),h('textarea',{id:'body-'+a})]));
     if(a==='listDoors'){
       fs.appendChild(lbl('Door element',h('input',{type:'text',id:'itemElement',size:'18'})));
       fs.appendChild(lbl('Id field',h('input',{type:'text',id:'idField',size:'18'})));
       fs.appendChild(lbl('Name field',h('input',{type:'text',id:'nameField',size:'18'})));
       fs.appendChild(lbl('Extra columns (comma separated)',h('input',{type:'text',id:'extraFields',size:'28'})));
+      fs.appendChild(lbl('Page size (0 = one request; paging needs {{start}} in the body)',h('input',{type:'number',id:'pageSize',min:'0',max:'100000',style:'width:7em'})));
     }
     box.appendChild(fs);
   });
@@ -2762,8 +3369,184 @@ function buildDoorStateSetup(){
     fs.appendChild(h('br'));
   }
   fs.appendChild(lbl('Label when no check matches',h('input',{type:'text',id:'ds-otherwise',size:'16'})));
-  fs.appendChild(lbl('Max doors per refresh or batch',h('input',{type:'number',id:'ds-max',min:'1',max:'5000',style:'width:90px'})));
+  fs.appendChild(lbl('Doors per socket session (more doors are split into several sessions)',h('input',{type:'number',id:'ds-max',min:'1',max:'5000',style:'width:90px'})));
   box.appendChild(fs);
+}
+/* ---- Setup: locations, door groups, arming ---- */
+function splitLines(t){return String(t||'').replace(/\r/g,'').split('\n').map(function(x){return x.trim();}).filter(function(x){return x;});}
+function readLocations(){
+  var levels=$('loc-levels').value.split(',').map(function(x){return x.trim();}).filter(function(x){return x;});
+  var rules=[];
+  splitLines($('loc-rules').value).forEach(function(line){
+    var m=/^(\S+)\s+(.+)$/.exec(line);
+    rules.push(m?{source:m[1],pattern:m[2].trim()}:{source:line,pattern:''});
+  });
+  var map={},first=true;
+  splitLines($('loc-map').value).forEach(function(line){
+    var cells=line.split(/[;\t]/).map(function(x){return x.trim();});
+    if(first){first=false;if(cells[0].toLowerCase()==='key'){return;}}
+    if(!cells[0]){return;}
+    var ent={};
+    for(var i=1;i<cells.length&&i<=levels.length;i++){if(cells[i]){ent[levels[i-1]]=cells[i];}}
+    map[cells[0]]=ent;
+  });
+  var labels={};
+  splitLines($('loc-labels').value).forEach(function(line){
+    var i=line.indexOf('=');if(i<1){return;}
+    var k=line.slice(0,i).trim(),v=line.slice(i+1).trim();
+    if(k&&v){labels[k]=v;}
+  });
+  return {levels:levels,rules:rules,map:map,labels:labels};
+}
+function fillLocations(){
+  var l=CFG.locations||{};
+  var levels=l.levels||[];
+  $('loc-levels').value=levels.join(', ');
+  $('loc-rules').value=(l.rules||[]).map(function(r){return r.source+' '+r.pattern;}).join('\n');
+  $('loc-map').value=Object.keys(l.map||{}).map(function(k){
+    var e=l.map[k]||{};return [k].concat(levels.map(function(lv){return e[lv]||'';})).join(';');
+  }).join('\n');
+  $('loc-labels').value=Object.keys(l.labels||{}).map(function(k){return k+'='+l.labels[k];}).join('\n');
+  var a=CFG.arming||{};
+  $('arm-action').value=a.armAction||'lock';$('arm-label').value=a.armLabel||'Arm';
+  $('disarm-action').value=a.disarmAction||'normal';$('disarm-label').value=a.disarmLabel||'Disarm';
+  var rows=$('grp-rows');rows.innerHTML='';
+  (CFG.groups||[]).forEach(addGroupRow);
+  updateLocTest();
+}
+function matchText(m){
+  return Object.keys(m||{}).map(function(k){return k+'='+[].concat(m[k]).join(',');}).join('; ');
+}
+function parseMatch(t){
+  var m={};
+  String(t||'').split(';').forEach(function(part){
+    var i=part.indexOf('=');if(i<1){return;}
+    var k=part.slice(0,i).trim();
+    var vals=part.slice(i+1).split(',').map(function(x){return x.trim();}).filter(function(x){return x;});
+    if(k&&vals.length){m[k]=vals;}
+  });
+  return m;
+}
+function addGroupRow(g){
+  g=g||{};
+  var row=h('div',{'class':'grp-edit'});
+  var cnt=h('span',{'class':'grp-matches'});
+  var nm=h('input',{type:'text','class':'grp-name',size:'18'});nm.value=g.name||'';
+  var mt=h('input',{type:'text','class':'grp-match',size:'40',placeholder:'city=BRU,ZAG; building=B1'});mt.value=matchText(g.match);
+  var ids=h('input',{type:'text','class':'grp-ids',size:'26'});ids.value=[].concat(g.doorIds||[]).join(', ');
+  var del=h('button',{'class':'grp-del',type:'button',text:'Remove'});
+  del.onclick=function(){row.parentNode.removeChild(row);};
+  [nm,mt,ids].forEach(function(el){el.oninput=updateGroupCounts;});
+  row.appendChild(lbl('Group name',nm));
+  row.appendChild(lbl('Locations: level=value,value; level=value',mt));
+  row.appendChild(lbl('Door ids (comma separated)',ids));
+  row.appendChild(cnt);row.appendChild(del);
+  $('grp-rows').appendChild(row);
+  updateGroupCounts();
+}
+function readGroups(){
+  var out=[];
+  Array.prototype.forEach.call(document.querySelectorAll('#grp-rows .grp-edit'),function(row){
+    var name=row.querySelector('.grp-name').value.trim();
+    var match=parseMatch(row.querySelector('.grp-match').value);
+    var ids=row.querySelector('.grp-ids').value.split(',').map(function(x){return x.trim();}).filter(function(x){return x;});
+    if(name||Object.keys(match).length||ids.length){out.push({name:name,match:match,doorIds:ids});}
+  });
+  return out;
+}
+function updateGroupCounts(){
+  if(!$('loc-levels')){return;}
+  var loc=readLocations();
+  var rows=document.querySelectorAll('#grp-rows .grp-edit');
+  Array.prototype.forEach.call(rows,function(row){
+    var g={name:'',match:parseMatch(row.querySelector('.grp-match').value),
+      doorIds:row.querySelector('.grp-ids').value.split(',').map(function(x){return x.trim();}).filter(function(x){return x;})};
+    var c=row.querySelector('.grp-matches');
+    if(!DOORS.length){c.textContent='Load the doors (Doors tab) to count the matches.';return;}
+    var n=DOORS.filter(function(d){return doorInGroup(d,placeDoor(d,loc),g);}).length;
+    c.textContent='matches '+n+' door'+(n===1?'':'s');
+  });
+}
+function updateLocTest(){
+  if(!$('loc-levels')){return;}
+  var loc=readLocations();
+  var t=$('loc-test-input').value;
+  var out=$('loc-test-out');out.innerHTML='';
+  function line(x){out.appendChild(h('div',{text:x}));}
+  if(!t){line('Type a controller or door name above to see how the rules read it.');}
+  else{
+    var won=false;
+    loc.rules.forEach(function(r,i){
+      var re=null;try{re=new RegExp(r.pattern);}catch(e){line('Rule '+(i+1)+': not a valid pattern ('+e.message+')');return;}
+      var m=re.exec(t);
+      if(!m){line('Rule '+(i+1)+' ('+r.source+'): no match');return;}
+      var g=m.groups||{};
+      var parts=Object.keys(g).filter(function(k){return g[k];}).map(function(k){return k+'='+g[k];});
+      line('Rule '+(i+1)+' ('+r.source+') matches: '+(parts.join(', ')||'(no named group has a value)')+(won?' - not used, an earlier rule won':''));
+      won=true;
+    });
+    if(!loc.rules.length){line('No rules yet.');}
+    var ex={};loc.rules.forEach(function(r){ex[r.source]=t;});
+    var pl=placeDoor({id:t,name:t,extra:ex},loc);
+    var res=h('div',{id:'loc-test-result',text:'Placed at: '+(pl.placed?pl.path.map(labelOfIn(loc)).join(' / '):'(unplaced)')});
+    out.appendChild(res);
+  }
+  var rc=$('loc-rule-counts');
+  if(!DOORS.length){rc.textContent='Load the doors (Doors tab) to see how many doors each rule places.';}
+  else{
+    var n=loc.rules.map(function(){return 0;}),mapOnly=0,un=0;
+    DOORS.forEach(function(d){
+      var pl2=placeDoor(d,loc);
+      if(pl2.rule>0){n[pl2.rule-1]++;}else if(pl2.placed){mapOnly++;}
+      if(!pl2.placed){un++;}
+    });
+    var parts2=loc.rules.map(function(r,i){return 'Rule '+(i+1)+' places '+n[i]+' of '+DOORS.length+' listed doors.';});
+    if(mapOnly){parts2.push('Placed by the map only: '+mapOnly+'.');}
+    parts2.push('Not placed: '+un+'.');
+    rc.textContent=parts2.join(' ');
+  }
+  updateGroupCounts();
+}
+function labelOfIn(loc){return function(v){return (loc.labels&&hasOwn(loc.labels,v)&&loc.labels[v])?loc.labels[v]:v;};}
+function buildLocationSetup(){
+  var box=$('setup-locations');box.innerHTML='';
+  var fl=h('fieldset',{id:'fs-locations'},[h('legend',{text:'Locations (read from the controller or door names)'})]);
+  fl.appendChild(h('p',{'class':'hint',text:'Controller names often hold the place. A rule reads one source (name, id, or an extra column such as HostName) with a regular expression; every named group becomes a field, for example (?<city>[A-Z]{3}). The first rule that matches wins. The map overrides the rules for names that do not follow the scheme. Leave the levels empty to switch locations off.'}));
+  fl.appendChild(lbl('Levels in order, comma separated (for example country, city, site, building, floor)',h('input',{type:'text',id:'loc-levels',size:'70'})));
+  fl.appendChild(h('label',{style:'display:block'},[h('span',{text:'Rules, one per line: <source> <pattern>'}),h('textarea',{id:'loc-rules',style:'min-height:60px'})]));
+  fl.appendChild(h('label',{style:'display:block'},[h('span',{text:'Map, one per line: key;level 1 value;level 2 value;... (key = door id, door name or an extra column value such as the controller name; the columns follow the levels above)'}),h('textarea',{id:'loc-map',style:'min-height:60px'})]));
+  var mf=h('input',{type:'file',id:'loc-map-file',accept:'.csv,.txt,text/csv,text/plain'});
+  mf.onchange=function(){
+    var f=mf.files&&mf.files[0];if(!f){return;}
+    var rd=new FileReader();
+    rd.onload=function(){
+      $('loc-map').value=String(rd.result||'').replace(/\r/g,'');updateLocTest();
+      setMsg('setup-msg','Map imported from '+f.name+' ('+splitLines($('loc-map').value).length+' line(s)). Press Save to keep it.','good');
+    };
+    rd.readAsText(f);
+  };
+  fl.appendChild(h('p',null,[h('label',null,[h('span',{text:'Import the map from a CSV file (separator ;)'}),mf])]));
+  fl.appendChild(h('label',{style:'display:block'},[h('span',{text:'Labels, one per line: value=display name (for example BRU=Brussels)'}),h('textarea',{id:'loc-labels',style:'min-height:44px'})]));
+  fl.appendChild(lbl('Tester: type a controller or door name',h('input',{type:'text',id:'loc-test-input',size:'40'})));
+  fl.appendChild(h('div',{id:'loc-test-out','class':'loc-out'}));
+  fl.appendChild(h('div',{id:'loc-rule-counts','class':'hint'}));
+  ['loc-levels','loc-rules','loc-map','loc-labels','loc-test-input'].forEach(function(id){fl.querySelector('#'+id).oninput=updateLocTest;});
+  box.appendChild(fl);
+  var fa=h('fieldset',{id:'fs-arming'},[h('legend',{text:'Arm / Disarm'})]);
+  fa.appendChild(h('p',{'class':'hint',text:'Arm and Disarm are two of the door actions above, run on many doors at once. Arm is normally Lock and Disarm is normally Normal.'}));
+  function actSel(id){return h('select',{id:id},DOOR_ACTIONS.map(function(a){return h('option',{value:a,text:a});}));}
+  fa.appendChild(lbl('Arm runs the action',actSel('arm-action')));
+  fa.appendChild(lbl('Arm button label',h('input',{type:'text',id:'arm-label',size:'14'})));
+  fa.appendChild(lbl('Disarm runs the action',actSel('disarm-action')));
+  fa.appendChild(lbl('Disarm button label',h('input',{type:'text',id:'disarm-label',size:'14'})));
+  box.appendChild(fa);
+  var fg=h('fieldset',{id:'fs-groups'},[h('legend',{text:'Door groups'})]);
+  fg.appendChild(h('p',{'class':'hint',text:'A group is a location filter (every listed level must match, any of its values) and / or a list of door ids. A new door on that floor joins the group by itself.'}));
+  fg.appendChild(h('div',{id:'grp-rows'}));
+  var add=h('button',{id:'grp-add',type:'button',text:'Add group'});
+  add.onclick=function(){addGroupRow({});};
+  fg.appendChild(add);
+  box.appendChild(fg);
 }
 function fillSetup(){
   $('cfg-aeosUrl').value=CFG.aeosUrl;$('cfg-wsdlUrl').value=CFG.wsdlUrl;$('cfg-soapVersion').value=CFG.soapVersion;
@@ -2782,7 +3565,8 @@ function fillSetup(){
   for(var i=1;i<=DS_ROWS;i++){var c=dc[i-1]||{};$('ds-label-'+i).value=c.label||'';$('ds-cmd-'+i).value=c.command||'';$('ds-match-'+i).value=c.matchPattern||'';}
   $('ds-otherwise').value=ds.otherwiseLabel||'';$('ds-max').value=ds.maxDoorsPerRefresh||500;
   var l=CFG.actions.listDoors;$('itemElement').value=l.itemElement;$('idField').value=l.idField;$('nameField').value=l.nameField;
-  $('extraFields').value=(l.extraFields||[]).join(', ');
+  $('extraFields').value=(l.extraFields||[]).join(', ');$('pageSize').value=l.pageSize||0;
+  fillLocations();
 }
 function readSetup(){
   var c=JSON.parse(JSON.stringify(CFG));
@@ -2808,6 +3592,10 @@ function readSetup(){
   c.doorState={checks:dchecks,otherwiseLabel:$('ds-otherwise').value.trim(),maxDoorsPerRefresh:parseInt($('ds-max').value,10)||500};
   var l=c.actions.listDoors;l.itemElement=$('itemElement').value.trim();l.idField=$('idField').value.trim();l.nameField=$('nameField').value.trim();
   l.extraFields=$('extraFields').value.split(',').map(function(s){return s.trim();}).filter(function(s){return s;});
+  l.pageSize=parseInt($('pageSize').value,10)||0;
+  c.locations=readLocations();
+  c.groups=readGroups();
+  c.arming={armAction:$('arm-action').value,disarmAction:$('disarm-action').value,armLabel:$('arm-label').value.trim(),disarmLabel:$('disarm-label').value.trim()};
   return c;
 }
 /* Save what is on the Setup tab, then reload it from the server (header, banners, doors follow). */
@@ -2842,7 +3630,7 @@ $('btn-test-list').onclick=function(){
   var out=$('test-list-out');out.style.display='none';setMsg('setup-msg','Testing...');
   api('GET','/api/v1/doors').then(function(r){
     out.style.display='';out.textContent=r.raw||'';
-    if(r.ok){setMsg('setup-msg','Parsed '+(r.doors||[]).length+' door(s) (request id '+r._rid+')','good');}
+    if(r.ok){setMsg('setup-msg','Parsed '+(r.doors||[]).length+' door(s) in '+(r.pages||1)+' page(s) (request id '+r._rid+')','good');}
     else{setMsg('setup-msg','AEOS answered with an error: '+(r.fault||('HTTP '+r.httpStatus))+' (request id '+r._rid+')','bad');}
   }).catch(function(e){setMsg('setup-msg',errText(e),'bad');});
 };
@@ -2911,6 +3699,7 @@ $('btn-diag').onclick=function(){
 /* ---- start ---- */
 buildSetupActions();
 buildDoorStateSetup();
+buildLocationSetup();
 api('GET','/api/v1/config').then(function(c){
   CFG=c;fillSetup();renderBanners();renderDoors();
   return loadLicense().then(function(){return api('GET','/api/v1/session');});

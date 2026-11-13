@@ -34,11 +34,12 @@
     "listDoors": {
       "operation": "findAccessPoint",
       "soapAction": "",
-      "body": "<{{ns}}:AccessPointSearchInfo><{{ns}}:AccessPointInfo/><{{ns}}:SearchRange><{{ns}}:startRecordNo>0</{{ns}}:startRecordNo><{{ns}}:nrOfRecords>500</{{ns}}:nrOfRecords></{{ns}}:SearchRange></{{ns}}:AccessPointSearchInfo>",
+      "body": "<s:AccessPointSearchInfo xmlns:s=\"http://www.nedap.com/aeosws/schema\"><s:AccessPointInfo/><s:SearchRange><s:startRecordNo>{{start}}</s:startRecordNo><s:nrOfRecords>{{pageSize}}</s:nrOfRecords></s:SearchRange></s:AccessPointSearchInfo>",
       "itemElement": "AccessPoint",
       "idField": "Id",
       "nameField": "Name",
-      "extraFields": ["HostName"]
+      "extraFields": ["HostName"],
+      "pageSize": 500
     },
     "lock":   { "label": "Lock",           "transport": "socket", "operation": "", "soapAction": "", "body": "", "command": "execute(lock,\"{{HostName}}:{{name}}\");",          "successPattern": "^Response:", "confirm": true },
     "unlock": { "label": "Unlock",         "transport": "socket", "operation": "", "soapAction": "", "body": "", "command": "execute(unlock,\"{{HostName}}:{{name}}\");",        "successPattern": "^Response:", "confirm": true },

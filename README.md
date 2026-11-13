@@ -51,12 +51,18 @@ Files created next to the script: `doorkeeper.json` (your settings), `doorkeeper
    | `{{name}}` | the door name (XML-escaped) |
    | `{{ns}}` | the namespace prefix from Setup (default `aeos`) |
    | `{{tns}}` | the target namespace (filled from the WSDL) |
+   | `{{start}}` | List doors only: the record offset of the page (0, page size, 2 x page size, ...) |
+   | `{{pageSize}}` | List doors only: the *Page size* |
 
    Example: `<aeos:SomeOperation><aeos:entranceId>{{id}}</aeos:entranceId></aeos:SomeOperation>`.
    A body that is not well-formed XML is refused before anything is sent.
 7. **Door list parsing.** For *List doors* set *Door element* (the XML element that repeats once per door), *Id field*
    and *Name field* (element names inside it) and optional *Extra columns*. Matching is by element name only, ignoring
    namespaces and prefixes. Use *Raw call* or *Test list* to look at a real response first if you do not know the names.
+   **Paging.** A server that returns only a limited number of doors per call (AEOS: 500) is read page by page: set
+   *Page size* to that number and put `{{start}}` (and `{{pageSize}}`) where the request takes the offset and the count.
+   DoorKeeper then asks page after page until a page comes back short; *Test list* says how many pages it read. A door
+   that comes back twice is listed once; a failed page fails the whole list. *Page size* 0 = one request.
 8. **Authentication.** *HTTP Basic* (default) sends the user and password in the HTTP header. *WS-Security
    UsernameToken* puts them in the SOAP header (PasswordText). Try Basic first; if AEOS answers 401 or a security fault,
    try the other.
@@ -95,7 +101,11 @@ log under the request id with control characters shown (`<CR>` `<LF>`); the logi
 | Provide access: Transport / Socket command | Socket / `execute(provideAccess,"{{HostName}}:{{name}}");` (seen in the AEOS audit log) |
 | Normal: Transport / Socket command | Socket / `execute(normal,"{{HostName}}:{{name}}");` (door back to access control activated; seen in the AEOS audit log) |
 | Success pattern (each action) | `^Response:` |
-| List doors | SOAP: operation `findAccessPoint`, Door element `AccessPoint`, Id field `Id`, Name field `Name`, Extra columns `HostName` (confirm with *Test list*) |
+| List doors | SOAP: operation `findAccessPoint`, Door element `AccessPoint`, Id field `Id`, Name field `Name`, Extra columns `HostName`, Page size `500` (first page tested on site 2026-11-13; paging not yet tested on site) |
+| List doors: request body | `<s:AccessPointSearchInfo xmlns:s="http://www.nedap.com/aeosws/schema"><s:AccessPointInfo/><s:SearchRange><s:startRecordNo>{{start}}</s:startRecordNo><s:nrOfRecords>{{pageSize}}</s:nrOfRecords></s:SearchRange></s:AccessPointSearchInfo>` |
+
+The AEOS request elements live in the schema namespace `http://www.nedap.com/aeosws/schema`, not in the WSDL target
+namespace, so the body declares it itself (a body in `{{ns}}` gets "Message part ... was not recognized").
 
 Ready-made settings with all the values above, the door list request and the two door state checks:
 `examples/aeos-2023.2/doorkeeper.json`. Stop DoorKeeper (Ctrl+C), copy that file next to `DoorKeeper.ps1` (it replaces
@@ -129,7 +139,7 @@ doors: login and init once, then the checks for every door. No timer: refresh by
 | Check 1: label / command / match | `Locked` / `execute(isLocked,"{{HostName}}:{{name}}");` / `^Response:true;$` |
 | Check 2: label / command / match | `Unlocked` / `execute(isUnlocked,"{{HostName}}:{{name}}");` / `^Response:true;$` |
 | Label when no check matches | `Normal` |
-| Max doors per refresh or batch | `500` |
+| Doors per socket session | `500` (more doors are read or sent in several sessions, one after the other) |
 
 UNVERIFIED on site: `isLocked` answered `Response:false;` on a real AEOS 2023.2; the `Response:true;` reply and the
 `isUnlocked` query have not been tried yet. Try them with the **Raw call** tab socket box on a locked and an unlocked
@@ -141,10 +151,78 @@ of doors and the first five names. Over the socket the whole batch is ONE sessio
 per door, then the state checks of every door. A door with a refused value (see above) is reported "refused, not
 sent" and the others go on. A SOAP action runs call by call. The page waits for the whole batch (the console handles
 one request at a time), then fills each row with its result and state. Every door gets its own audit record, tagged
-`batch:<request id>`. The number of doors per batch or refresh is limited by *Max doors per refresh or batch*.
+`batch:<request id>`. More doors than *Doors per socket session* go in several sessions, one after the other.
 
 **Lockdown** locks every door in the list (not only the shown or selected ones) with the Lock action. Its confirm
 dialog names the action, the number of doors and the first five names. It shows only when Lock is mapped.
+
+## Locations, door groups and Arm / Disarm (Doors tab)
+
+Controller or door names often hold the place of the door. DoorKeeper reads it from the names, shows the doors as a
+tree and arms a whole building, floor or city in one step. All of it is off until you type the *levels* on the Setup tab.
+The examples use a MADE-UP scheme, `BE-BRU-HQ1-B1-F00` = country-city-site-building-floor; your site has its own.
+
+**Setup tab, Locations.**
+- *Levels*: the level names in order, comma separated (`country, city, site, building, floor`). Plain names, no spaces.
+- *Rules*, one per line: `<source> <pattern>`. The source is `name`, `id` or an extra column of the door list (for
+  example `HostName`). The pattern is a regular expression with NAMED groups, for example
+  `HostName ^(?<country>[A-Z]{2})-(?<city>[A-Z]{3})-(?<site>[A-Z0-9]+)-(?<building>B\d+)-(?<floor>F\d+)$`. Rules are tried in
+  order and the first one that matches wins; each named group becomes a field of the door.
+- *Map*, one line per name that does not follow the scheme: `key;value level 1;value level 2;...` (the columns follow
+  the levels; the key is a door id, a door name or a value of an extra column such as the controller name). The map
+  overrides the rules. *Import the map from a CSV file* fills the box from a file (a first line starting with `key` is
+  skipped). The Setup page keeps only the level columns of a map line.
+- *Labels*, one per line: `BRU=Brussels`. The tree shows the label, the columns and the reports keep the value.
+- *Tester*: type a controller or door name and see which rules match, which fields they give and where the door lands;
+  below it, how many of the listed doors each rule places and how many stay unplaced. It works on what is on the page
+  now, before Save.
+A door whose first level is empty is shown under `(unplaced)`. A door that has the first levels only (for example
+country and city) is placed on those nodes and goes no deeper.
+
+**Doors tab.** A tree of the levels sits beside the list. Each node shows its door count and a state summary
+(`9 doors - 7 Locked, 2 Normal`). Click a node name to show only its doors (*Show all doors* clears it); tick a node to
+select all its doors; tick several nodes on any levels (two floors, a floor in another city). The list gets one column per
+level, and the filter box also finds a location value or label. **Arm** and **Disarm** are on every tree node, on every
+group and on the batch bar (`Arm selected`). Arm runs the door action in `arming.armAction` (default `lock`), Disarm the
+one in `arming.disarmAction` (default `normal`); labels `arming.armLabel` / `arming.disarmLabel`. The confirm names the
+place and the number of doors. If that action is not mapped the button is switched off and its tooltip says so; with the
+license switched off it is switched off like every other door action. Arm and Disarm use the normal batch: one socket
+session, one audit record per door, the state read afterwards, more doors than *Doors per socket session* split into several sessions.
+
+**Door groups** (Setup tab, *Door groups*; `groups` in the config): a name, a location filter such as
+`city=BRU,ZAG; building=B1` (a door must match EVERY listed level, any one of a level's values) and / or a list of door
+ids. A door that matches the filter or is in the list belongs to the group, so a new door on that floor joins by itself.
+The editor shows how many listed doors each group matches. On the Doors tab a group has *Select* (selects only its
+doors), *Arm* and *Disarm*.
+
+**Arming report.** After every Arm or Disarm a panel shows what was requested, how many went OK, how many failed
+(door, location, reply or fault, state after) and the state of every door afterwards. *Retry failed* runs the action
+again on the failed doors only; *Export CSV* downloads the report, which is also kept next to the audit file as
+`doorkeeper-arming-<stamp>.csv` with the columns `time, action, group_or_selection, door_id, door_name, location, ok,
+reply_or_fault, state_after` (a cell that starts with `=`, `+`, `-` or `@` gets a `'` in front).
+
+Config keys (also in `config.template.json`): `locations { levels[], rules[{source, pattern}], map{}, labels{} }`,
+`groups[{name, match{level: [values]}, doorIds[]}]`, `arming{armAction, disarmAction, armLabel, disarmLabel}`.
+Routes: the batch route `POST /api/v1/doors/batch` takes an optional `report: { label }` (and answers with
+`reportFile`); `GET /api/v1/arming/report?file=<name>` downloads a report file. Locations are worked out on the page
+from the door list; the console runs the same rules (`Get-DoorLocation`) for the location column of the report, and
+`tests\fixtures\locations.json` feeds both so they stay equal.
+
+## XProtect maps check: Xprotect-MapCheck.ps1
+
+Read-only check of the classic maps in a Milestone XProtect system (a building picture whose clickable areas, "hot
+zones", open the floor plan of each floor, with cameras and doors placed on them). It logs in to the management server
+with your Windows login (or `-Credential`) and only reads: the maps, their picture type and size, which floor plan each
+hot zone opens, the items on every map by type (other types than cameras / maps / hot zones are listed with sample
+names - access control doors show up there), and how many cameras have a Smart Map position. Floor plans are
+sensitive: pictures are saved only with `-SaveImages <folder>`, and only inside that folder.
+
+```
+powershell -ExecutionPolicy Bypass -File .\Xprotect-MapCheck.ps1 -ManagementServer <management server> -Out mapcheck.txt
+```
+
+Add `-SkipCertCheck` when the server certificate is not trusted on this PC. The maps part of the XProtect REST API is
+not documented by Milestone; a later XProtect version may change it.
 
 ## Finding the right operations: Aeos-WsdlHelper.ps1
 
@@ -188,7 +266,7 @@ network unencrypted.
 
 ## Tabs
 
-- **Doors**: load, filter, and run the mapped actions. Each row shows the result and a **request id**.
+- **Doors**: load, filter, and run the mapped actions. Each row shows the result and a **request id**. With locations set up: the location tree, door groups, Arm / Disarm and the arming report.
 - **Setup**: license, connection and mappings (above).
 - **Raw call**: send any request body to the service and see the response. Use this to explore the web service.
 - **Audit**: the last 50 door actions and whether the audit chain is intact.
